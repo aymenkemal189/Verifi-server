@@ -133,15 +133,13 @@ function parseVerifyInput(refIn, smsIn) {
 }
 // </HELPERS>
 
-function fetchCbeTransactionDetail(code) {
+function fetchHttps(hostname, path, headers) {
     return new Promise((resolve, reject) => {
         const req = https.request({
-            hostname: 'mb.cbe.com.et',
-            path: `/api/v1/transactions/public/transaction-detail/${encodeURIComponent(code)}`,
-            method: 'GET', headers: CBE_HEADERS, rejectUnauthorized: false, timeout: 6000
+            hostname, path, method: 'GET', headers: headers || CBE_HEADERS, rejectUnauthorized: false, timeout: 6000
         }, (res) => {
             let data = '';
-            res.on('data', c => { if (data.length < 200000) data += c; });
+            res.on('data', c => { if (data.length < 300000) data += c; });
             res.on('end', () => resolve({ status: res.statusCode, body: data }));
         });
         req.on('timeout', () => req.destroy(new Error('timeout')));
@@ -150,19 +148,28 @@ function fetchCbeTransactionDetail(code) {
     });
 }
 
-// returns FT number or null (never returns the v2 code). Tries the code without and with the "v2-" prefix.
+// every known way to turn a v2 receipt code into an FT number
+function cbeTargets(code) {
+    const raw = code.replace(/^v2-/i, '');
+    const enc = encodeURIComponent;
+    return [
+        { name: 'api-raw',   host: 'mb.cbe.com.et', path: `/api/v1/transactions/public/transaction-detail/${enc(raw)}`, headers: CBE_HEADERS },
+        { name: 'api-v2',    host: 'mb.cbe.com.et', path: `/api/v1/transactions/public/transaction-detail/${enc('v2-' + raw)}`, headers: CBE_HEADERS },
+        { name: 'receipt-page', host: 'mbreciept.cbe.com.et', path: `/${enc('v2-' + raw)}`, headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'text/html,application/json' } }
+    ];
+}
+
+// returns FT number or null (never returns the v2 code)
 async function resolveFtNumber(v2Code, attempts = 1) {
     if (!v2Code) return null;
-    const raw = v2Code.replace(/^v2-/i, '');
-    const variants = [raw, 'v2-' + raw];
     for (let i = 0; i < attempts; i++) {
-        for (const v of variants) {
+        for (const t of cbeTargets(v2Code)) {
             try {
-                const r = await fetchCbeTransactionDetail(v);
+                const r = await fetchHttps(t.host, t.path, t.headers);
                 const m = r.body.match(/\b(FT[A-Z0-9]{8,15})\b/i);
                 if (m) return m[1].toUpperCase();
-                console.log(`CBE lookup ${v.slice(0, 8)}… -> HTTP ${r.status}, no FT in body`);
-            } catch (e) { console.log(`CBE lookup ${v.slice(0, 8)}… failed: ${e.message}`); }
+                console.log(`CBE ${t.name} -> HTTP ${r.status}, no FT in body (${r.body.length} bytes)`);
+            } catch (e) { console.log(`CBE ${t.name} failed: ${e.message}`); }
         }
         if (i < attempts - 1) await sleep(1500);
     }
@@ -289,14 +296,13 @@ app.get('/api/cbe/debug', async (req, res) => {
     if (!auth(req, res)) return;
     const m = String(req.query.v2 || '').match(/v2-[A-Za-z0-9_-]+/i);
     if (!m) return res.json({ status: 'Missing_V2' });
-    const raw = m[0].replace(/^v2-/i, '');
     const out = [];
-    for (const v of [raw, 'v2-' + raw]) {
+    for (const t of cbeTargets(m[0])) {
         try {
-            const r = await fetchCbeTransactionDetail(v);
+            const r = await fetchHttps(t.host, t.path, t.headers);
             const ft = r.body.match(/\b(FT[A-Z0-9]{8,15})\b/i);
-            out.push({ tried: v.slice(0, 6) + '…', http: r.status, ft: ft ? ft[1].toUpperCase() : null, body: r.body.slice(0, 300) });
-        } catch (e) { out.push({ tried: v.slice(0, 6) + '…', error: e.message }); }
+            out.push({ target: t.name, http: r.status, bytes: r.body.length, ft: ft ? ft[1].toUpperCase() : null, body: r.body.replace(/\s+/g, ' ').slice(0, 400) });
+        } catch (e) { out.push({ target: t.name, error: e.message }); }
     }
     return res.json({ status: 'OK', results: out });
 });
