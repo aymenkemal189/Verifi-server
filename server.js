@@ -148,13 +148,14 @@ function fetchHttps(hostname, path, headers) {
     });
 }
 
-// every known way to turn a v2 receipt code into an FT number
+// every known way to turn a v2 receipt code into an FT number.
+// NOTE: CBE now requires the FULL code including the "v2-" prefix (without it: "Invalid or tampered legacy token").
 function cbeTargets(code) {
     const raw = code.replace(/^v2-/i, '');
     const enc = encodeURIComponent;
     return [
-        { name: 'api-raw',   host: 'mb.cbe.com.et', path: `/api/v1/transactions/public/transaction-detail/${enc(raw)}`, headers: CBE_HEADERS },
         { name: 'api-v2',    host: 'mb.cbe.com.et', path: `/api/v1/transactions/public/transaction-detail/${enc('v2-' + raw)}`, headers: CBE_HEADERS },
+        { name: 'api-raw',   host: 'mb.cbe.com.et', path: `/api/v1/transactions/public/transaction-detail/${enc(raw)}`, headers: CBE_HEADERS },
         { name: 'receipt-page', host: 'mbreciept.cbe.com.et', path: `/${enc('v2-' + raw)}`, headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'text/html,application/json' } }
     ];
 }
