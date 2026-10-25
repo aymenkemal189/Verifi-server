@@ -364,6 +364,59 @@ app.get('/api/verify', async (req, res) => {
     }
 });
 
+// ================= 4. READ-ONLY CHECK (never changes anything) =================
+// Works for ANY row: Received or Transferred. ref = FT | v2 code | receipt link | Telebirr ref | full SMS.  &live=1 also asks CBE.
+async function locate(inp) {
+    if (inp.type === 'tb') return { table: 'telebirr_transactions', col: 'ref_no', val: inp.value, bank: 'Telebirr' };
+    const o = { table: 'cbe_transactions', bank: 'CBE', col: 'ref_no', val: inp.value };
+    if (inp.type === 'v2') {
+        o.col = 'v2_code';
+        const r = await pool.query('SELECT id, ref_no FROM cbe_transactions WHERE v2_code=$1', [inp.value]);
+        if (!r.rows.length || !r.rows[0].ref_no) {
+            const ft = await resolveFtNumber(inp.value, 1);
+            if (ft) { if (r.rows.length) await settleFt(r.rows[0].id, ft).catch(() => {}); o.col = 'ref_no'; o.val = ft; }
+        }
+    }
+    return o;
+}
+
+app.get('/api/check', async (req, res) => {
+    if (!auth(req, res)) return;
+    const inp = parseVerifyInput(req.query.ref, req.query.sms || req.query.text);
+    if (!inp) return res.json({ status: 'Missing_Ref' });
+    try {
+        const t = await locate(inp);
+        const r = await pool.query(`SELECT * FROM ${t.table} WHERE ${t.col} = $1`, [t.val]);
+        if (!r.rows.length) return res.json({ status: 'Not_Found', bank: t.bank, looked_for: t.val });
+        const x = r.rows[0];
+        const out = {
+            status: x.ref_no ? 'Found' : 'Found_FT_Pending', bank: t.bank, type: x.tx_type, amount: parseFloat(x.amount),
+            ref_no: x.ref_no, party: x.sender_name, usage: x.status, category: x.category || null,
+            balance: x.balance != null ? parseFloat(x.balance) : null, v2_code: x.v2_code || null, created_at: x.created_at || null
+        };
+        if (req.query.live && t.bank === 'CBE' && (x.v2_code || inp.type === 'v2')) {
+            try {
+                const tg = cbeTargets(x.v2_code || inp.value)[0];
+                const j = JSON.parse((await fetchHttps(tg.host, tg.path, tg.headers)).body);
+                out.cbe_live = { ft: j.id, amount: j.debitAmount, from: j.debitAccountNo, to: j.creditAccountNo, date: j.debitValueDate,
+                    amount_matches_db: Math.abs(parseFloat(j.debitAmount) - out.amount) < 0.001 };
+            } catch (e) { out.cbe_live = { error: e.message }; }
+        }
+        return res.json(out);
+    } catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
+});
+
+app.get('/api/recent', async (req, res) => {
+    if (!auth(req, res)) return;
+    const n = Math.min(Math.max(parseInt(req.query.limit) || 20, 1), 100);
+    try {
+        const cols = 'id, tx_type, amount, ref_no, sender_name, status, category, balance';
+        const c = await pool.query(`SELECT ${cols}, v2_code, resolve_attempts FROM cbe_transactions ORDER BY id DESC LIMIT $1`, [n]);
+        const t = await pool.query(`SELECT ${cols} FROM telebirr_transactions ORDER BY id DESC LIMIT $1`, [n]);
+        return res.json({ status: 'OK', cbe: c.rows, telebirr: t.rows });
+    } catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
+});
+
 app.get('/', (req, res) => res.json({ status: 'ok' }));
 
 if (require.main === module) {
