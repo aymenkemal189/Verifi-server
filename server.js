@@ -150,16 +150,20 @@ function fetchCbeTransactionDetail(code) {
     });
 }
 
-// returns FT number or null (never returns the v2 code)
+// returns FT number or null (never returns the v2 code). Tries the code without and with the "v2-" prefix.
 async function resolveFtNumber(v2Code, attempts = 1) {
     if (!v2Code) return null;
     const raw = v2Code.replace(/^v2-/i, '');
+    const variants = [raw, 'v2-' + raw];
     for (let i = 0; i < attempts; i++) {
-        try {
-            const r = await fetchCbeTransactionDetail(raw);
-            const m = r.body.match(/\b(FT[A-Z0-9]{8,15})\b/i);
-            if (m) return m[1].toUpperCase();
-        } catch (e) { /* retry */ }
+        for (const v of variants) {
+            try {
+                const r = await fetchCbeTransactionDetail(v);
+                const m = r.body.match(/\b(FT[A-Z0-9]{8,15})\b/i);
+                if (m) return m[1].toUpperCase();
+                console.log(`CBE lookup ${v.slice(0, 8)}… -> HTTP ${r.status}, no FT in body`);
+            } catch (e) { console.log(`CBE lookup ${v.slice(0, 8)}… failed: ${e.message}`); }
+        }
         if (i < attempts - 1) await sleep(1500);
     }
     return null;
@@ -280,6 +284,23 @@ app.get('/api/cbe/pending', async (req, res) => {
     } catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
 });
 
+// Diagnose the CBE lookup: /api/cbe/debug?token=..&v2=<code or link>
+app.get('/api/cbe/debug', async (req, res) => {
+    if (!auth(req, res)) return;
+    const m = String(req.query.v2 || '').match(/v2-[A-Za-z0-9_-]+/i);
+    if (!m) return res.json({ status: 'Missing_V2' });
+    const raw = m[0].replace(/^v2-/i, '');
+    const out = [];
+    for (const v of [raw, 'v2-' + raw]) {
+        try {
+            const r = await fetchCbeTransactionDetail(v);
+            const ft = r.body.match(/\b(FT[A-Z0-9]{8,15})\b/i);
+            out.push({ tried: v.slice(0, 6) + '…', http: r.status, ft: ft ? ft[1].toUpperCase() : null, body: r.body.slice(0, 300) });
+        } catch (e) { out.push({ tried: v.slice(0, 6) + '…', error: e.message }); }
+    }
+    return res.json({ status: 'OK', results: out });
+});
+
 // ================= 3. VERIFY (Dash Bingo) =================
 // ref = FT | v2 code | receipt link | Telebirr ref   (or sms = the full SMS text)
 app.get('/api/verify', async (req, res) => {
@@ -316,8 +337,8 @@ app.get('/api/verify', async (req, res) => {
         const result = await client.query(`SELECT * FROM ${table} WHERE ${col} = $1 FOR UPDATE`, [val]);
         if (result.rows.length === 0) { await client.query('ROLLBACK'); return res.json({ status: 'Pending', bank: bankName }); }
         const tx = result.rows[0];
-        if (!tx.ref_no) { await client.query('ROLLBACK'); return res.json({ status: 'Resolving', bank: bankName }); }
         if (tx.tx_type !== 'Received') { await client.query('ROLLBACK'); return res.json({ status: 'Invalid_Transaction_Type', bank: bankName }); }
+        if (!tx.ref_no) { await client.query('ROLLBACK'); return res.json({ status: 'Resolving', bank: bankName }); }
         if (tx.status !== 'Unused') { await client.query('ROLLBACK'); return res.json({ status: 'AlreadyUsed', bank: bankName }); }
         const actualAmount = parseFloat(tx.amount);
         if (Math.abs(actualAmount - expectedAmount) > 0.001) {
