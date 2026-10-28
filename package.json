@@ -1,10 +1,13 @@
 {
-  "name": "telebirr-verifier-api",
-  "version": "1.0.0",
-  "description": "Telebirr Deposit Verifier for Dash Bingo",
+  "name": "verifi-server",
+  "version": "1.1.0",
+  "description": "Telebirr and CBE payment gateway for Dash Bingo",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
+  },
+  "engines": {
+    "node": "20.x"
   },
   "dependencies": {
     "cors": "^2.8.5",
