@@ -11,6 +11,10 @@ if (!SECRET_TOKEN && require.main === module) {
     process.exit(1);
 }
 
+// >>>>> NEW (AGENT) START: optional verify-only token (Render > Environment > VERIFY_TOKEN). If not set, nothing changes.
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+// <<<<< NEW (AGENT) END
+
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -213,14 +217,49 @@ function auth(req, res) {
     return true;
 }
 
+// >>>>> NEW (AGENT) START: helpers
+// verify endpoint accepts the admin SECRET_TOKEN, or the optional VERIFY_TOKEN (if set in Render)
+function authVerify(req, res) {
+    const t = req.query.token;
+    if (t === SECRET_TOKEN || (VERIFY_TOKEN && t === VERIFY_TOKEN)) return true;
+    res.status(401).json({ status: 'Unauthorized' });
+    return false;
+}
+
+// agent found by his own token (agent phone sends SMS with this token)
+async function findAgentByToken(tk) {
+    if (!tk) return null;
+    const r = await pool.query('SELECT id, name FROM agents WHERE token=$1 AND active', [tk]);
+    return r.rows[0] || null;
+}
+
+// agent found by account text inside the SMS (used when the SMS arrives from the admin phone)
+async function findAgentByMsg(msg) {
+    const r = await pool.query("SELECT id, name, match_text FROM agents WHERE active AND COALESCE(match_text,'') <> ''");
+    return r.rows.find(a => msg.includes(a.match_text)) || null;
+}
+// <<<<< NEW (AGENT) END
+
 // ================= 1. SMS WEBHOOK =================
 app.get('/webhook/sms', async (req, res) => {
-    if (!auth(req, res)) return;
+    // >>>>> NEW (AGENT) START: admin token OR agent token (replaces: if (!auth(req, res)) return;)
+    let agent = null;
+    if (req.query.token !== SECRET_TOKEN) {
+        try { agent = await findAgentByToken(req.query.token); }
+        catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
+        if (!agent) return res.status(401).json({ status: 'Unauthorized' });
+    }
+    // <<<<< NEW (AGENT) END
     const { message } = req.query;
     if (!message) return res.status(400).json({ status: 'Error', message: 'No SMS provided' });
 
     const c = classify(message, req.query.sender);
     if (!c.isIncoming && !c.isOutgoing) return res.json({ status: 'Ignored', reason: 'Not a payment SMS' });
+
+    // >>>>> NEW (AGENT) START: if admin phone, detect agent by account text in the SMS
+    if (!agent && c.isIncoming) { try { agent = await findAgentByMsg(c.msg); } catch (e) { console.error(e); } }
+    const agentId = agent ? agent.id : null;
+    // <<<<< NEW (AGENT) END
 
     const amount = extractAmount(c.msg);
     const balance = extractBalance(c.msg);
@@ -245,15 +284,17 @@ app.get('/webhook/sms', async (req, res) => {
     try {
         let result;
         if (c.isCbe) {
+            // NEW (AGENT): added agent_id column + $10
             result = await pool.query(
-                `INSERT INTO cbe_transactions (tx_type, sender_name, amount, ref_no, raw_sms, status, category, balance, v2_code)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING RETURNING id`,
-                [txType, party, amount, ref, c.msg, status, category, balance, v2]);
+                `INSERT INTO cbe_transactions (tx_type, sender_name, amount, ref_no, raw_sms, status, category, balance, v2_code, agent_id)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING RETURNING id`,
+                [txType, party, amount, ref, c.msg, status, category, balance, v2, agentId]);
         } else {
+            // NEW (AGENT): added agent_id column + $9
             result = await pool.query(
-                `INSERT INTO telebirr_transactions (tx_type, sender_name, amount, ref_no, raw_sms, status, category, balance)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING RETURNING id`,
-                [txType, party, amount, ref, c.msg, status, category, balance]);
+                `INSERT INTO telebirr_transactions (tx_type, sender_name, amount, ref_no, raw_sms, status, category, balance, agent_id)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING RETURNING id`,
+                [txType, party, amount, ref, c.msg, status, category, balance, agentId]);
         }
         if (result.rows.length === 0) return res.json({ status: 'Duplicate', bank: c.bank, ref: ref || v2 });
         if (c.isCbe && !ref) {
@@ -311,7 +352,7 @@ app.get('/api/cbe/debug', async (req, res) => {
 // ================= 3. VERIFY (Dash Bingo) =================
 // ref = FT | v2 code | receipt link | Telebirr ref   (or sms = the full SMS text)
 app.get('/api/verify', async (req, res) => {
-    if (!auth(req, res)) return;
+    if (!authVerify(req, res)) return; // NEW (AGENT): was auth(req, res); now also accepts optional VERIFY_TOKEN
     const inp = parseVerifyInput(req.query.ref, req.query.sms || req.query.text);
     if (!inp) return res.json({ status: 'Missing_Ref' });
     let expectedAmount = parseFloat(req.query.amount);
@@ -392,7 +433,8 @@ app.get('/api/check', async (req, res) => {
         const out = {
             status: x.ref_no ? 'Found' : 'Found_FT_Pending', bank: t.bank, type: x.tx_type, amount: parseFloat(x.amount),
             ref_no: x.ref_no, party: x.sender_name, usage: x.status, category: x.category || null,
-            balance: x.balance != null ? parseFloat(x.balance) : null, v2_code: x.v2_code || null, created_at: x.created_at || null
+            balance: x.balance != null ? parseFloat(x.balance) : null, v2_code: x.v2_code || null, created_at: x.created_at || null,
+            agent_id: x.agent_id || null // NEW (AGENT): shows which agent (null = admin)
         };
         if (req.query.live && t.bank === 'CBE' && (x.v2_code || inp.type === 'v2')) {
             try {
@@ -410,12 +452,49 @@ app.get('/api/recent', async (req, res) => {
     if (!auth(req, res)) return;
     const n = Math.min(Math.max(parseInt(req.query.limit) || 20, 1), 100);
     try {
-        const cols = 'id, tx_type, amount, ref_no, sender_name, status, category, balance';
+        const cols = 'id, tx_type, amount, ref_no, sender_name, status, category, balance, agent_id'; // NEW (AGENT): agent_id added
         const c = await pool.query(`SELECT ${cols}, v2_code, resolve_attempts FROM cbe_transactions ORDER BY id DESC LIMIT $1`, [n]);
         const t = await pool.query(`SELECT ${cols} FROM telebirr_transactions ORDER BY id DESC LIMIT $1`, [n]);
         return res.json({ status: 'OK', cbe: c.rows, telebirr: t.rows });
     } catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
 });
+
+// >>>>> NEW (AGENT) START: 5. AGENTS REPORTS (admin SECRET_TOKEN only)
+// All agents totals: /api/agents?token=..
+app.get('/api/agents', async (req, res) => {
+    if (!auth(req, res)) return;
+    try {
+        const r = await pool.query(
+            `SELECT a.id, a.name, a.active,
+                    COALESCE(SUM(d.amount),0) AS total_in,
+                    COUNT(d.tx_id) AS count_in,
+                    COALESCE(SUM(d.amount) FILTER (WHERE (d.created_at AT TIME ZONE 'Africa/Addis_Ababa')::date = (NOW() AT TIME ZONE 'Africa/Addis_Ababa')::date),0) AS today_in
+             FROM agents a LEFT JOIN agent_deposits d ON d.agent_id = a.id
+             GROUP BY a.id ORDER BY a.id`);
+        return res.json({ status: 'OK', agents: r.rows });
+    } catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
+});
+
+// One agent's deposits: /api/agent/deposits?token=..&agent=1&from=2026-10-01&to=2026-10-31&limit=50
+app.get('/api/agent/deposits', async (req, res) => {
+    if (!auth(req, res)) return;
+    const id = parseInt(req.query.agent);
+    if (isNaN(id)) return res.json({ status: 'Missing_Agent' });
+    const n = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 500);
+    const from = req.query.from || '1970-01-01';
+    const to = req.query.to || '2999-12-31';
+    try {
+        const r = await pool.query(
+            `SELECT bank, tx_id, amount, ref_no, sender_name, balance, status, created_at
+             FROM agent_deposits
+             WHERE agent_id = $1
+               AND (created_at AT TIME ZONE 'Africa/Addis_Ababa')::date BETWEEN $2::date AND $3::date
+             ORDER BY created_at DESC LIMIT $4`, [id, from, to, n]);
+        const total = r.rows.reduce((s, x) => s + parseFloat(x.amount), 0);
+        return res.json({ status: 'OK', agent: id, count: r.rows.length, total, items: r.rows });
+    } catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
+});
+// <<<<< NEW (AGENT) END
 
 app.get('/', (req, res) => res.json({ status: 'ok' }));
 
