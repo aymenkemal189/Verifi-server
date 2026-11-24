@@ -10,20 +10,25 @@ if (!SECRET_TOKEN && require.main === module) {
     console.error('SECRET_TOKEN env var is missing. Set it in Render > Environment.');
     process.exit(1);
 }
-
-// >>>>> NEW (AGENT) START: optional verify-only token (Render > Environment > VERIFY_TOKEN). If not set, nothing changes.
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
-// <<<<< NEW (AGENT) END
 
 const app = express();
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.disable('x-powered-by');
+app.set('etag', false);
+app.use(express.json({ limit: '10kb' }));
+app.use(express.urlencoded({ extended: true, limit: '10kb' }));
 app.use(cors());
 
+// small pool + short idle time: lets the database go to sleep when nothing happens
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }
+    ssl: { rejectUnauthorized: false },
+    max: 4,
+    idleTimeoutMillis: 10000,
+    connectionTimeoutMillis: 10000
 });
+pool.on('error', (e) => console.error('pool error:', e.message));
+process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e && e.message));
 
 const CBE_HEADERS = {
     'X-App-ID': 'd1292e42-7400-49de-a2d3-9731caa4c819',
@@ -33,6 +38,14 @@ const CBE_HEADERS = {
 };
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// ---------- small in-memory caches (cut repeat DB + CBE calls) ----------
+const ftHit = new Map();    // v2 code -> FT number (found)
+const ftMiss = new Map();   // v2 code -> time of last failed CBE lookup
+const pendCache = new Map(); // verify "Pending/Resolving" answers (cleared on any new/settled SMS)
+const MISS_TTL = 20000;
+const PEND_TTL = 4000;
+function trim(map, max) { while (map.size > max) map.delete(map.keys().next().value); }
 
 // <HELPERS>
 const AM_IN = /ተቀብለዋል|ገቢ ሆኗል/;
@@ -152,8 +165,7 @@ function fetchHttps(hostname, path, headers) {
     });
 }
 
-// every known way to turn a v2 receipt code into an FT number.
-// NOTE: CBE now requires the FULL code including the "v2-" prefix (without it: "Invalid or tampered legacy token").
+// NOTE: CBE needs the FULL code including the "v2-" prefix.
 function cbeTargets(code) {
     const raw = code.replace(/^v2-/i, '');
     const enc = encodeURIComponent;
@@ -165,27 +177,40 @@ function cbeTargets(code) {
 }
 
 // returns FT number or null (never returns the v2 code)
-async function resolveFtNumber(v2Code, attempts = 1) {
+// force=true (background resolver) skips the "recently failed" shortcut
+async function resolveFtNumber(v2Code, attempts = 1, force = false) {
     if (!v2Code) return null;
+    if (ftHit.has(v2Code)) return ftHit.get(v2Code);
+    const missAt = ftMiss.get(v2Code);
+    if (!force && missAt && Date.now() - missAt < MISS_TTL) return null;
     for (let i = 0; i < attempts; i++) {
         for (const t of cbeTargets(v2Code)) {
             try {
                 const r = await fetchHttps(t.host, t.path, t.headers);
                 const m = r.body.match(/\b(FT[A-Z0-9]{8,15})\b/i);
-                if (m) return m[1].toUpperCase();
+                if (m) {
+                    const ft = m[1].toUpperCase();
+                    ftHit.set(v2Code, ft); trim(ftHit, 300); ftMiss.delete(v2Code);
+                    return ft;
+                }
                 console.log(`CBE ${t.name} -> HTTP ${r.status}, no FT in body (${r.body.length} bytes)`);
             } catch (e) { console.log(`CBE ${t.name} failed: ${e.message}`); }
         }
         if (i < attempts - 1) await sleep(1500);
     }
+    ftMiss.set(v2Code, Date.now()); trim(ftMiss, 300);
     return null;
 }
 
-// ---------- background resolver for CBE rows still waiting for FT ----------
+// ---------- background resolver (NO polling: runs only while rows are waiting) ----------
 let resolverBusy = false;
+let resolverTimer = null;
+const RESOLVE_EVERY = 30000;
+
 async function settleFt(id, ft) {
     try {
         await pool.query('UPDATE cbe_transactions SET ref_no=$1 WHERE id=$2 AND ref_no IS NULL', [ft, id]);
+        pendCache.clear();
         return 'Resolved';
     } catch (e) {
         if (e.code === '23505') { // FT already stored (duplicate SMS) -> drop the pending twin
@@ -195,21 +220,45 @@ async function settleFt(id, ft) {
         throw e;
     }
 }
+
+// returns true if there is still work to do later
 async function resolvePending() {
-    if (resolverBusy) return;
+    if (resolverBusy) return true;
     resolverBusy = true;
     try {
         const { rows } = await pool.query(
             `SELECT id, v2_code FROM cbe_transactions
-             WHERE ref_no IS NULL AND v2_code IS NOT NULL AND COALESCE(resolve_attempts,0) < 40
+             WHERE ref_no IS NULL AND v2_code IS NOT NULL AND resolve_attempts < 40
              ORDER BY id LIMIT 10`);
+        if (!rows.length) return false;
+        const failed = [];
         for (const row of rows) {
-            const ft = await resolveFtNumber(row.v2_code, 1);
-            if (ft) await settleFt(row.id, ft);
-            else await pool.query('UPDATE cbe_transactions SET resolve_attempts = COALESCE(resolve_attempts,0)+1 WHERE id=$1', [row.id]);
+            const ft = await resolveFtNumber(row.v2_code, 1, true);
+            if (ft) await settleFt(row.id, ft); else failed.push(row.id);
         }
-    } catch (e) { console.error('resolver:', e.message); }
+        if (failed.length) await pool.query('UPDATE cbe_transactions SET resolve_attempts = resolve_attempts+1 WHERE id = ANY($1::bigint[])', [failed]);
+        return failed.length > 0 || rows.length === 10;
+    } catch (e) { console.error('resolver:', e.message); return true; }
     finally { resolverBusy = false; }
+}
+
+// explicit ms = fresh work (new SMS / startup): restart from a short delay.
+// no ms = retry after a failed round: delay doubles (15s, 30s, 60s ... max 5 min).
+let resolveDelay = 15000;
+function scheduleResolve(ms) {
+    const fresh = ms !== undefined;
+    if (resolverTimer) {
+        if (!fresh) return;
+        clearTimeout(resolverTimer);
+    }
+    if (fresh) resolveDelay = 15000;
+    resolverTimer = setTimeout(async () => {
+        resolverTimer = null;
+        if (await resolvePending()) {
+            resolveDelay = Math.min(resolveDelay * 2, 300000);
+            scheduleResolve();
+        }
+    }, fresh ? ms : resolveDelay);
 }
 
 function auth(req, res) {
@@ -217,8 +266,6 @@ function auth(req, res) {
     return true;
 }
 
-// >>>>> NEW (AGENT) START: helpers
-// verify endpoint accepts the admin SECRET_TOKEN, or the optional VERIFY_TOKEN (if set in Render)
 function authVerify(req, res) {
     const t = req.query.token;
     if (t === SECRET_TOKEN || (VERIFY_TOKEN && t === VERIFY_TOKEN)) return true;
@@ -226,40 +273,39 @@ function authVerify(req, res) {
     return false;
 }
 
-// agent found by his own token (agent phone sends SMS with this token)
+// ---------- agents: ONE cached query instead of one per SMS ----------
+const AGENT_TTL = 60000;
+let agentCache = { list: null, at: 0 };
+async function getAgents() {
+    if (agentCache.list && Date.now() - agentCache.at < AGENT_TTL) return agentCache.list;
+    const r = await pool.query('SELECT id, name, token, match_text FROM agents WHERE active');
+    agentCache = { list: r.rows, at: Date.now() };
+    return agentCache.list;
+}
 async function findAgentByToken(tk) {
     if (!tk) return null;
-    const r = await pool.query('SELECT id, name FROM agents WHERE token=$1 AND active', [tk]);
-    return r.rows[0] || null;
+    return (await getAgents()).find(a => a.token === tk) || null;
 }
-
-// agent found by account text inside the SMS (used when the SMS arrives from the admin phone)
 async function findAgentByMsg(msg) {
-    const r = await pool.query("SELECT id, name, match_text FROM agents WHERE active AND COALESCE(match_text,'') <> ''");
-    return r.rows.find(a => msg.includes(a.match_text)) || null;
+    return (await getAgents()).find(a => a.match_text && msg.includes(a.match_text)) || null;
 }
-// <<<<< NEW (AGENT) END
 
 // ================= 1. SMS WEBHOOK =================
 app.get('/webhook/sms', async (req, res) => {
-    // >>>>> NEW (AGENT) START: admin token OR agent token (replaces: if (!auth(req, res)) return;)
     let agent = null;
     if (req.query.token !== SECRET_TOKEN) {
         try { agent = await findAgentByToken(req.query.token); }
         catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
         if (!agent) return res.status(401).json({ status: 'Unauthorized' });
     }
-    // <<<<< NEW (AGENT) END
     const { message } = req.query;
     if (!message) return res.status(400).json({ status: 'Error', message: 'No SMS provided' });
 
     const c = classify(message, req.query.sender);
     if (!c.isIncoming && !c.isOutgoing) return res.json({ status: 'Ignored', reason: 'Not a payment SMS' });
 
-    // >>>>> NEW (AGENT) START: if admin phone, detect agent by account text in the SMS
     if (!agent && c.isIncoming) { try { agent = await findAgentByMsg(c.msg); } catch (e) { console.error(e); } }
     const agentId = agent ? agent.id : null;
-    // <<<<< NEW (AGENT) END
 
     const amount = extractAmount(c.msg);
     const balance = extractBalance(c.msg);
@@ -271,7 +317,7 @@ app.get('/webhook/sms', async (req, res) => {
         ref = extractDirectFt(c.msg);
         v2 = extractV2Code(c.msg);
         if (!ref && v2) ref = await resolveFtNumber(v2, 1); // one quick try; the rest runs in background
-        if (!ref && !v2) ref = 'CBE-' + crypto.createHash('sha1').update(c.msg).digest('hex').slice(0, 12).toUpperCase(); // no FT/link (ATM, fees): stable key from the SMS text
+        if (!ref && !v2) ref = 'CBE-' + crypto.createHash('sha1').update(c.msg).digest('hex').slice(0, 12).toUpperCase();
     } else {
         ref = extractTelebirrRef(c.msg);
         if (!ref) return res.json({ status: 'Ignored', reason: 'Missing Ref' });
@@ -284,21 +330,20 @@ app.get('/webhook/sms', async (req, res) => {
     try {
         let result;
         if (c.isCbe) {
-            // NEW (AGENT): added agent_id column + $10
             result = await pool.query(
                 `INSERT INTO cbe_transactions (tx_type, sender_name, amount, ref_no, raw_sms, status, category, balance, v2_code, agent_id)
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING RETURNING id`,
                 [txType, party, amount, ref, c.msg, status, category, balance, v2, agentId]);
         } else {
-            // NEW (AGENT): added agent_id column + $9
             result = await pool.query(
                 `INSERT INTO telebirr_transactions (tx_type, sender_name, amount, ref_no, raw_sms, status, category, balance, agent_id)
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING RETURNING id`,
                 [txType, party, amount, ref, c.msg, status, category, balance, agentId]);
         }
         if (result.rows.length === 0) return res.json({ status: 'Duplicate', bank: c.bank, ref: ref || v2 });
+        pendCache.clear(); // a new row exists now: cached "Pending" answers are stale
         if (c.isCbe && !ref) {
-            setTimeout(resolvePending, 3000);
+            scheduleResolve(3000);
             return res.json({ status: 'Saved', bank: c.bank, type: txType, amount, ref: null, resolving: true, v2 });
         }
         return res.json({ status: 'Saved', bank: c.bank, type: txType, category, ref, amount });
@@ -309,7 +354,6 @@ app.get('/webhook/sms', async (req, res) => {
 });
 
 // ================= 2. CBE manual FT / pending list =================
-// Paste the FT from the CBE app: /api/cbe/resolve?token=..&v2=<code or full link>&ft=FT26298NXW57
 app.get('/api/cbe/resolve', async (req, res) => {
     if (!auth(req, res)) return;
     const m = String(req.query.v2 || '').match(/v2-[A-Za-z0-9_-]+/i);
@@ -327,13 +371,13 @@ app.get('/api/cbe/pending', async (req, res) => {
     if (!auth(req, res)) return;
     try {
         const r = await pool.query(
-            `SELECT id, v2_code, amount, sender_name, COALESCE(resolve_attempts,0) AS attempts
+            `SELECT id, v2_code, amount, sender_name, resolve_attempts AS attempts
              FROM cbe_transactions WHERE ref_no IS NULL ORDER BY id DESC LIMIT 50`);
         return res.json({ status: 'OK', count: r.rows.length, items: r.rows });
     } catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
 });
 
-// Diagnose the CBE lookup: /api/cbe/debug?token=..&v2=<code or link>
+// Diagnose the CBE lookup (no database use)
 app.get('/api/cbe/debug', async (req, res) => {
     if (!auth(req, res)) return;
     const m = String(req.query.v2 || '').match(/v2-[A-Za-z0-9_-]+/i);
@@ -350,63 +394,71 @@ app.get('/api/cbe/debug', async (req, res) => {
 });
 
 // ================= 3. VERIFY (Dash Bingo) =================
-// ref = FT | v2 code | receipt link | Telebirr ref   (or sms = the full SMS text)
+// Success path = ONE atomic query (no BEGIN/COMMIT, no lock, no extra SELECT).
+async function tryUse(table, col, val, amount) {
+    const r = await pool.query(
+        `UPDATE ${table} SET status='Used'
+         WHERE ${col}=$1 AND tx_type='Received' AND status='Unused' AND ref_no IS NOT NULL AND ABS(amount-$2) < 0.001
+         RETURNING amount, ref_no, sender_name`, [val, amount]);
+    return r.rows[0] || null;
+}
+
+async function whyNot(table, col, val, bank, expected) {
+    const r = await pool.query(`SELECT tx_type, ref_no, status, amount FROM ${table} WHERE ${col}=$1`, [val]);
+    if (!r.rows.length) return { status: 'Pending', bank };
+    const tx = r.rows[0];
+    if (tx.tx_type !== 'Received') return { status: 'Invalid_Transaction_Type', bank };
+    if (!tx.ref_no) return { status: 'Resolving', bank };
+    if (tx.status !== 'Unused') return { status: 'AlreadyUsed', bank };
+    return { status: 'InvalidAmount', expected, actual: parseFloat(tx.amount), bank };
+}
+
 app.get('/api/verify', async (req, res) => {
-    if (!authVerify(req, res)) return; // NEW (AGENT): was auth(req, res); now also accepts optional VERIFY_TOKEN
+    if (!authVerify(req, res)) return;
     const inp = parseVerifyInput(req.query.ref, req.query.sms || req.query.text);
     if (!inp) return res.json({ status: 'Missing_Ref' });
-    let expectedAmount = parseFloat(req.query.amount);
-    if (isNaN(expectedAmount) && inp.amount) expectedAmount = inp.amount;
-    if (isNaN(expectedAmount) || expectedAmount <= 0) return res.json({ status: 'Missing_Amount' });
+    let expected = parseFloat(req.query.amount);
+    if (isNaN(expected) && inp.amount) expected = inp.amount;
+    if (isNaN(expected) || expected <= 0) return res.json({ status: 'Missing_Amount' });
 
-    let table, col, val, bankName;
+    // clients polling a not-yet-arrived payment: answer from memory for a few seconds
+    const key = inp.type + ':' + inp.value + ':' + expected;
+    const hit = pendCache.get(key);
+    if (hit && Date.now() - hit.t < PEND_TTL) return res.json(hit.body);
+
+    const isTb = inp.type === 'tb';
+    const table = isTb ? 'telebirr_transactions' : 'cbe_transactions';
+    const bank = isTb ? 'Telebirr' : 'CBE';
+    let col = (inp.type === 'v2') ? 'v2_code' : 'ref_no';
+    let val = inp.value;
+    const done = (tx) => res.json({ status: 'Verified', bank, amount: parseFloat(tx.amount), ref_no: tx.ref_no, from_to: tx.sender_name });
+
     try {
-        if (inp.type === 'tb') { table = 'telebirr_transactions'; col = 'ref_no'; val = inp.value; bankName = 'Telebirr'; }
-        else {
-            table = 'cbe_transactions'; bankName = 'CBE';
-            if (inp.type === 'ft') { col = 'ref_no'; val = inp.value; }
-            else { // v2: use the stored row, or resolve the FT right now
-                col = 'v2_code'; val = inp.value;
-                const r = await pool.query('SELECT id, ref_no FROM cbe_transactions WHERE v2_code=$1', [val]);
-                if (!r.rows.length || !r.rows[0].ref_no) {
-                    const ft = await resolveFtNumber(val, 1);
-                    if (ft) {
-                        if (r.rows.length) await settleFt(r.rows[0].id, ft).catch(() => {});
-                        col = 'ref_no'; val = ft;
-                    }
+        let tx = await tryUse(table, col, val, expected);
+        if (tx) return done(tx);
+
+        if (inp.type === 'v2') { // row missing or FT not stored yet: resolve the FT right now
+            const r = await pool.query('SELECT id, ref_no FROM cbe_transactions WHERE v2_code=$1', [val]);
+            if (!r.rows.length || !r.rows[0].ref_no) {
+                const ft = await resolveFtNumber(val, 1);
+                if (ft) {
+                    if (r.rows.length) await settleFt(r.rows[0].id, ft).catch(() => {});
+                    col = 'ref_no'; val = ft;
+                    tx = await tryUse(table, col, val, expected);
+                    if (tx) return done(tx);
                 }
             }
         }
-    } catch (e) { console.error(e); return res.status(500).json({ status: 'System_Busy' }); }
-
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-        const result = await client.query(`SELECT * FROM ${table} WHERE ${col} = $1 FOR UPDATE`, [val]);
-        if (result.rows.length === 0) { await client.query('ROLLBACK'); return res.json({ status: 'Pending', bank: bankName }); }
-        const tx = result.rows[0];
-        if (tx.tx_type !== 'Received') { await client.query('ROLLBACK'); return res.json({ status: 'Invalid_Transaction_Type', bank: bankName }); }
-        if (!tx.ref_no) { await client.query('ROLLBACK'); return res.json({ status: 'Resolving', bank: bankName }); }
-        if (tx.status !== 'Unused') { await client.query('ROLLBACK'); return res.json({ status: 'AlreadyUsed', bank: bankName }); }
-        const actualAmount = parseFloat(tx.amount);
-        if (Math.abs(actualAmount - expectedAmount) > 0.001) {
-            await client.query('ROLLBACK');
-            return res.json({ status: 'InvalidAmount', expected: expectedAmount, actual: actualAmount, bank: bankName });
-        }
-        await client.query(`UPDATE ${table} SET status = 'Used' WHERE id = $1`, [tx.id]);
-        await client.query('COMMIT');
-        return res.json({ status: 'Verified', bank: bankName, amount: actualAmount, ref_no: tx.ref_no, from_to: tx.sender_name });
+        const why = await whyNot(table, col, val, bank, expected);
+        if (why.status === 'Pending' || why.status === 'Resolving') { pendCache.set(key, { t: Date.now(), body: why }); trim(pendCache, 500); }
+        return res.json(why);
     } catch (err) {
-        await client.query('ROLLBACK');
         console.error(err);
         return res.status(500).json({ status: 'System_Busy' });
-    } finally {
-        client.release();
     }
 });
 
 // ================= 4. READ-ONLY CHECK (never changes anything) =================
-// Works for ANY row: Received or Transferred. ref = FT | v2 code | receipt link | Telebirr ref | full SMS.  &live=1 also asks CBE.
 async function locate(inp) {
     if (inp.type === 'tb') return { table: 'telebirr_transactions', col: 'ref_no', val: inp.value, bank: 'Telebirr' };
     const o = { table: 'cbe_transactions', bank: 'CBE', col: 'ref_no', val: inp.value };
@@ -434,7 +486,7 @@ app.get('/api/check', async (req, res) => {
             status: x.ref_no ? 'Found' : 'Found_FT_Pending', bank: t.bank, type: x.tx_type, amount: parseFloat(x.amount),
             ref_no: x.ref_no, party: x.sender_name, usage: x.status, category: x.category || null,
             balance: x.balance != null ? parseFloat(x.balance) : null, v2_code: x.v2_code || null, created_at: x.created_at || null,
-            agent_id: x.agent_id || null // NEW (AGENT): shows which agent (null = admin)
+            agent_id: x.agent_id || null
         };
         if (req.query.live && t.bank === 'CBE' && (x.v2_code || inp.type === 'v2')) {
             try {
@@ -452,15 +504,16 @@ app.get('/api/recent', async (req, res) => {
     if (!auth(req, res)) return;
     const n = Math.min(Math.max(parseInt(req.query.limit) || 20, 1), 100);
     try {
-        const cols = 'id, tx_type, amount, ref_no, sender_name, status, category, balance, agent_id'; // NEW (AGENT): agent_id added
-        const c = await pool.query(`SELECT ${cols}, v2_code, resolve_attempts FROM cbe_transactions ORDER BY id DESC LIMIT $1`, [n]);
-        const t = await pool.query(`SELECT ${cols} FROM telebirr_transactions ORDER BY id DESC LIMIT $1`, [n]);
+        const cols = 'id, tx_type, amount, ref_no, sender_name, status, category, balance, agent_id';
+        const [c, t] = await Promise.all([
+            pool.query(`SELECT ${cols}, v2_code, resolve_attempts FROM cbe_transactions ORDER BY id DESC LIMIT $1`, [n]),
+            pool.query(`SELECT ${cols} FROM telebirr_transactions ORDER BY id DESC LIMIT $1`, [n])
+        ]);
         return res.json({ status: 'OK', cbe: c.rows, telebirr: t.rows });
     } catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
 });
 
-// >>>>> NEW (AGENT) START: 5. AGENTS REPORTS (admin SECRET_TOKEN only)
-// All agents totals: /api/agents?token=..
+// ================= 5. AGENTS REPORTS (admin SECRET_TOKEN only) =================
 app.get('/api/agents', async (req, res) => {
     if (!auth(req, res)) return;
     try {
@@ -475,7 +528,6 @@ app.get('/api/agents', async (req, res) => {
     } catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
 });
 
-// One agent's deposits: /api/agent/deposits?token=..&agent=1&from=2026-10-01&to=2026-10-31&limit=50
 app.get('/api/agent/deposits', async (req, res) => {
     if (!auth(req, res)) return;
     const id = parseInt(req.query.agent);
@@ -494,16 +546,15 @@ app.get('/api/agent/deposits', async (req, res) => {
         return res.json({ status: 'OK', agent: id, count: r.rows.length, total, items: r.rows });
     } catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
 });
-// <<<<< NEW (AGENT) END
 
+// health check: never touches the database (safe for UptimeRobot / Render pings)
 app.get('/', (req, res) => res.json({ status: 'ok' }));
 
 if (require.main === module) {
     const PORT = process.env.PORT || 3000;
     app.listen(PORT, () => {
         console.log(`Unified Gateway running on port ${PORT}`);
-        setInterval(resolvePending, 20000);
-        setTimeout(resolvePending, 5000);
+        scheduleResolve(5000); // one check at startup; keeps running only if rows are pending
     });
 }
 module.exports = { classify, extractAmount, extractBalance, extractTelebirrRef, extractParty, detectCategory, extractV2Code, extractDirectFt, parseVerifyInput };
