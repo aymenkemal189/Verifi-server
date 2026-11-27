@@ -11,16 +11,18 @@ if (!SECRET_TOKEN && require.main === module) {
     process.exit(1);
 }
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || '';
+const RETENTION_DAYS = Math.max(parseInt(process.env.RETENTION_DAYS || '30', 10) || 30, 7);
 
 const app = express();
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cors());
 
+// Small pool + short idle timeout so DB connections are never exhausted
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false },
-    max: 6,
+    max: 4,
     idleTimeoutMillis: 10000,
     connectionTimeoutMillis: 10000
 });
@@ -35,42 +37,31 @@ const CBE_HEADERS = {
 };
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const param = (req, k) => {
-    const q = req.query && req.query[k];
-    if (q !== undefined && q !== '') return q;
-    const b = req.body && req.body[k];
-    return (b !== undefined && b !== '') ? b : undefined;
-};
+const NON_HULUBET_CATEGORIES = ['ATM/Card', 'Airtime', 'Data', 'Bill'];
 
-function extractToken(req) {
-    const authHdr = req.headers && req.headers.authorization;
-    if (authHdr && /^Bearer\s+/i.test(authHdr)) return authHdr.replace(/^Bearer\s+/i, '').trim();
-    if (req.headers && req.headers['x-token']) return String(req.headers['x-token']).trim();
-    const t = param(req, 'token');
-    return t ? String(t).trim() : '';
-}
-
-// ================= SMS PARSING & ACCOUNT MATCHING =================
+// ================= PARSING HELPERS =================
 const AM_IN = /ተቀብለዋል|ገቢ ሆኗል/;
-const AM_OUT = /ከፍለዋል|ልከዋል|አስተላልፈዋል|ገዝተዋል|ተላልፏል/;
+const AM_OUT = /ከፍለዋል|ልከዋል|አስተላልፈዋል|ገዝተዋል|ተላልፏል|ወጪ ሆኗል/;
 const NUM = '([0-9,]+(?:\\.[0-9]{1,2})?)';
 
-function stripBalance(msg) {
-    return msg.replace(/(?:ቀሪ\s*ሂሳብ|balance)[^0-9]{0,15}[0-9,]+(?:\.[0-9]{1,2})?\s*(?:ብር|ETB|Birr)?/ig, ' ');
+function stripBalanceAndFees(msg) {
+    return msg
+        .replace(/(?:ቀሪ\s*ሂሳብ|current\s*(?:account\s*)?balance|balance(?:\s*is)?)[^0-9]{0,20}[0-9,]+(?:\.[0-9]{1,2})?\s*(?:ብር|ETB|Birr)?/ig, ' ')
+        .replace(/(?:service\s*(?:fee|charge)|vat\s*\(?\d*%?\)?|disaster\s*recovery\s*\(?\d*%?\)?)[^0-9]{0,25}[0-9,]+(?:\.[0-9]{1,2})?\s*(?:ብር|ETB|Birr)?/ig, ' ');
 }
 
 function extractAmount(msg) {
     if (!msg) return 0;
-    const m = stripBalance(msg);
-    const match = m.match(new RegExp('(?:received|transferred|paid|credited|debited)\\s+(?:ETB|Birr)\\s*' + NUM, 'i'))
-        || m.match(new RegExp('(?:received|transferred|paid|credited|debited)\\s+' + NUM + '\\s*(?:ETB|Birr)', 'i'))
+    const m = stripBalanceAndFees(msg);
+    const match = m.match(new RegExp('(?:received|transferred|withdraw(?:n)?|paid|credited|debited)\\s+(?:ETB|Birr)\\s*' + NUM, 'i'))
+        || m.match(new RegExp('(?:received|transferred|withdraw(?:n)?|paid|credited|debited)\\s+' + NUM + '\\s*(?:ETB|Birr)', 'i'))
         || m.match(new RegExp('(?:ETB|Birr)\\s*' + NUM, 'i'))
         || m.match(new RegExp(NUM + '\\s*ብር'));
     return match ? parseFloat(match[1].replace(/,/g, '')) : 0;
 }
 
 function extractBalance(msg) {
-    const m = msg.match(/(?:ቀሪ\s*ሂሳብ|balance(?: is)?)[^0-9]{0,15}([0-9,]+(?:\.[0-9]{1,2})?)/i);
+    const m = msg.match(/(?:ቀሪ\s*ሂሳብ|current\s*(?:account\s*)?balance|balance(?:\s*is)?)[^0-9]{0,15}([0-9,]+(?:\.[0-9]{1,2})?)/i);
     return m ? parseFloat(m[1].replace(/,/g, '')) : null;
 }
 
@@ -93,6 +84,15 @@ function extractV2Code(msg) {
     return m ? normV2(m[1]) : null;
 }
 
+function extractRecipientAccount(msg, isCbe) {
+    if (isCbe) {
+        const m = msg.match(/to\s+account\s+([0-9*]{4,20})/i) || msg.match(/account\s+([0-9*]{4,20})/i);
+        return m ? m[1].trim() : null;
+    }
+    const tb = msg.match(/\(([0-9*+]{6,16})\)/);
+    return tb ? tb[1].trim() : null;
+}
+
 function extractParty(msg, isIncoming, bank) {
     if (bank === 'CBE') {
         for (const g of msg.matchAll(/\(([^)]+)\)/g)) {
@@ -101,94 +101,26 @@ function extractParty(msg, isIncoming, bank) {
         const f = isIncoming ? msg.match(/from\s+([A-Za-z0-9\s*]+)/i) : msg.match(/to\s+([A-Za-z0-9\s*]+)/i);
         return f ? f[1].trim().slice(0, 100) : 'CBE Client';
     }
+    if (/withdraw/i.test(msg) && /ATM/i.test(msg)) {
+        const atm = msg.match(/using\s+(.+?\s+ATM)\b/i);
+        return atm ? atm[1].trim().slice(0, 100) : 'Telebirr ATM';
+    }
     if (AM_IN.test(msg) || AM_OUT.test(msg)) {
-        const m = isIncoming ? msg.match(/ከ\s+(.+?)\s*\(/) : msg.match(/ለ\s+([^\s(]+)/);
+        const m = isIncoming ? msg.match(/ከ\s+(.+?)\s*\(/) : msg.match(/ለ\s+(\S+)/);
         return m ? m[1].trim().slice(0, 100) : 'Telebirr Client';
     }
     const m = isIncoming ? msg.match(/from\s+([^(]+)\(/i) : msg.match(/to\s+([^(]+)\(/i);
     return m ? m[1].trim().slice(0, 100) : 'Telebirr Client';
 }
 
-function extractRecipientAccount(msg, isIncoming, bank) {
-    if (!msg) return null;
-    if (bank === 'CBE') {
-        if (!isIncoming) {
-            const m1 = msg.match(/\bto\s+(?:account\s*)?(?:no\.?\s*)?([0-9][0-9*]{4,18}[0-9])\b/i);
-            if (m1) return m1[1].trim();
-            const m2 = msg.match(/\bto\s+[^(\n]{1,60}\(\s*([0-9][0-9*]{4,18}[0-9])\s*\)/i);
-            if (m2) return m2[1].trim();
-            const m3 = msg.match(/\(([0-9*]{5,18})\)/);
-            if (m3 && /\d{2,}/.test(m3[1])) return m3[1].trim();
-        } else {
-            const m = msg.match(/\bfrom\s+(?:account\s*)?([0-9][0-9*]{4,18}[0-9])\b/i);
-            if (m) return m[1].trim();
-        }
-        return null;
-    }
-    const pParen = msg.match(/\(((?:\+?251|0)?[79][0-9*]{4,11}[0-9])\)/);
-    if (pParen) return pParen[1].replace(/^\+/, '');
-    if (!isIncoming) {
-        const pAm = msg.match(/ለ\s*(?:\S+\s+)?\(?((?:\+?251|0)?[79][0-9*]{4,11}[0-9])\)?/);
-        if (pAm) return pAm[1].replace(/^\+/, '');
-        const pEn = msg.match(/\bto\s+(?:[A-Za-z.\s]{1,40})?((?:\+?251|0)?[79][0-9*]{4,11}[0-9])\b/i);
-        if (pEn) return pEn[1].replace(/^\+/, '');
-    } else {
-        const pIn = msg.match(/(?:from|ከ)\s+(?:[A-Za-z.\s]{1,40})?((?:\+?251|0)?[79][0-9*]{4,11}[0-9])\b/i);
-        if (pIn) return pIn[1].replace(/^\+/, '');
-    }
-    return null;
-}
-
-function normalizePhoneCore(val) {
-    const clean = String(val || '').replace(/[\s\-+]/g, '');
-    if (/^251[79]\d{8}$/.test(clean)) return clean.slice(3);
-    if (/^0[79]\d{8}$/.test(clean)) return clean.slice(1);
-    if (/^[79]\d{8}$/.test(clean)) return clean;
-    return null;
-}
-
-function normalizeAccountMasked(val) {
-    let s = String(val || '').replace(/[\s\-+]/g, '');
-    if (!s) return '';
-    if (s.startsWith('251') && s.length >= 8) s = s.slice(3);
-    else if (/^0[79]/.test(s) && s.length >= 6) s = s.slice(1);
-    return s;
-}
-
-function accountsMatch(smsAcc, reqAcc) {
-    const aRaw = String(smsAcc || '').replace(/[\s\-+]/g, '');
-    const bRaw = String(reqAcc || '').replace(/[\s\-+]/g, '');
-    if (!aRaw || !bRaw) return false;
-    if (aRaw === bRaw) return true;
-
-    const aPhone = normalizePhoneCore(aRaw);
-    const bPhone = normalizePhoneCore(bRaw);
-    if (aPhone && bPhone) return aPhone === bPhone;
-
-    const aNorm = normalizeAccountMasked(aRaw);
-    const bNorm = normalizeAccountMasked(bRaw);
-    if (aNorm === bNorm) return true;
-
-    const matchMask = (masked, plain) => {
-        if (!masked.includes('*') || plain.includes('*')) return false;
-        const parts = masked.split(/\*+/);
-        if (parts.length !== 2) return false;
-        const [pre, suf] = parts;
-        const isEthPhone = /^[79]\d{8}$/.test(plain);
-        const minSuf = isEthPhone ? 3 : 4;
-        if (suf.length < minSuf) return false;
-        if (!pre && suf.length < 4) return false;
-        return plain.startsWith(pre) && plain.endsWith(suf) && plain.length >= pre.length + suf.length;
-    };
-
-    return matchMask(aNorm, bNorm) || matchMask(bNorm, aNorm) || matchMask(aRaw, bRaw) || matchMask(bRaw, aRaw);
-}
-
 function detectCategory(msg, isIncoming) {
     if (isIncoming) return 'Received';
-    if (/has been debited with ETB\s*[0-9,.]+\s*including Service charge/i.test(msg) && !/to account/i.test(msg)) return 'ATM/Card';
+    if (/\bATM\b|withdraw\s+ETB|has been debited with ETB\s*[0-9,.]+\s*including Service charge/i.test(msg) && !/to account/i.test(msg)) {
+        return 'ATM/Card';
+    }
     if (/አየር\s*ሰዓት|የአየር|airtime|recharge|top\s*up/i.test(msg)) return 'Airtime';
     if (/ኢንተርኔት|ዳታ|ጥቅል|data|package|bundle/i.test(msg)) return 'Data';
+    if (/ethio\s*telecom\s*bill|electric|water\s*bill|utility|dstv|ticket|tax/i.test(msg)) return 'Bill';
     if (/ከፍለዋል|paid|purchase/i.test(msg)) return 'Payment';
     return 'Transfer';
 }
@@ -201,8 +133,12 @@ function classify(message, sender) {
     else if (/cbe/i.test(snd)) isCbe = true;
     else isCbe = /cbe\.com\.et|\bFT[A-Z0-9]{8,15}\b|from account\s+[0-9*]+|banking with CBE/i.test(msg);
     const bank = isCbe ? 'CBE' : 'Telebirr';
-    const outEn = isCbe ? /you have (?:successfully )?transferred|has been debited|a debit transaction/i : /you have (?:successfully )?transferred|you have paid/i;
-    const inEn = isCbe ? /you have received|has been credited|a credit transaction/i : /you have received/i;
+    const outEn = isCbe
+        ? /you have (?:successfully )?transferred|has been debited|a debit transaction/i
+        : /you have (?:successfully )?transferred|you have paid|request to withdraw\s+ETB/i;
+    const inEn = isCbe
+        ? /you have received|has been credited|a credit transaction/i
+        : /you have received/i;
     const inPos = msg.search(inEn), outPos = msg.search(outEn);
     let isIncoming = inEn.test(msg) || (!isCbe && AM_IN.test(msg));
     let isOutgoing = outEn.test(msg) || (!isCbe && AM_OUT.test(msg));
@@ -219,7 +155,6 @@ function parseVerifyInput(refIn, smsIn) {
     const amount = long ? extractAmount(text) : 0;
     const ft = extractDirectFt(text);
     if (ft) return { type: 'ft', value: ft, amount };
-    if (/^CBE-[A-Z0-9]{8,16}$/i.test(text)) return { type: 'ft', value: text.toUpperCase(), amount };
     const v2 = text.match(/\b(v2-[A-Za-z0-9_-]{6,})/i);
     if (v2) return { type: 'v2', value: normV2(v2[1]), amount };
     const rc = text.match(/receipt\/([A-Z0-9]{8,14})\b/i);
@@ -227,7 +162,216 @@ function parseVerifyInput(refIn, smsIn) {
     return tb ? { type: 'tb', value: tb, amount } : null;
 }
 
-// ================= CBE RECEIPT RESOLVER =================
+// ================= FUZZY NAME MATCHER (1-2 TYPOS + FIRST/FULL NAME) =================
+function normalizeNameTokens(name) {
+    const cleaned = String(name || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .replace(/\b(?:ato|wro|mr|mrs|ms|dr|eng)\b/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    return cleaned ? cleaned.split(' ').filter(t => t.length >= 2) : [];
+}
+
+function levenshtein(a, b) {
+    if (a === b) return 0;
+    const m = a.length, n = b.length;
+    if (m === 0) return n;
+    if (n === 0) return m;
+    const dp = Array.from({ length: n + 1 }, (_, j) => j);
+    for (let i = 1; i <= m; i++) {
+        let prev = dp[0];
+        dp[0] = i;
+        for (let j = 1; j <= n; j++) {
+            const tmp = dp[j];
+            if (a[i - 1] === b[j - 1]) dp[j] = prev;
+            else dp[j] = 1 + Math.min(prev, dp[j], dp[j - 1]);
+            prev = tmp;
+        }
+    }
+    return dp[n];
+}
+
+function tokenSimilarity(a, b) {
+    if (a === b) return { ok: true, score: 1.0 };
+    if (a.length >= 3 && b.startsWith(a)) return { ok: true, score: 0.92 };
+    if (b.length >= 3 && a.startsWith(b)) return { ok: true, score: 0.90 };
+    const maxLen = Math.max(a.length, b.length);
+    const maxAllowedDist = maxLen <= 4 ? 1 : 2;
+    const dist = levenshtein(a, b);
+    if (dist <= maxAllowedDist) {
+        return { ok: true, score: Math.max(0.65, 1 - dist / (maxLen + 1)) };
+    }
+    return { ok: false, score: 0 };
+}
+
+function scoreNameMatch(requestedName, candidateParty) {
+    const reqTokens = normalizeNameTokens(requestedName);
+    const candTokens = normalizeNameTokens(candidateParty);
+    if (!reqTokens.length || !candTokens.length) return { matched: false, score: 0 };
+
+    const reqJoin = reqTokens.join('');
+    const candJoin = candTokens.join('');
+    if (reqJoin === candJoin) return { matched: true, score: 1.0 };
+    if (reqJoin.length >= 6 && candJoin.startsWith(reqJoin)) return { matched: true, score: 0.95 };
+
+    let totalScore = 0;
+    let matchedCount = 0;
+    for (let i = 0; i < reqTokens.length; i++) {
+        const rt = reqTokens[i];
+        let best = 0;
+        for (let j = 0; j < candTokens.length; j++) {
+            const sim = tokenSimilarity(rt, candTokens[j]);
+            if (sim.ok) {
+                const posBonus = (i === 0 && j === 0) ? 0.08 : 0;
+                best = Math.max(best, sim.score + posBonus);
+            }
+        }
+        if (best > 0) {
+            matchedCount++;
+            totalScore += best;
+        }
+    }
+
+    const firstMatched = candTokens.some(ct => tokenSimilarity(reqTokens[0], ct).ok);
+    const requiredMatches = reqTokens.length <= 2 ? reqTokens.length : Math.ceil(reqTokens.length * 0.75);
+    if (!firstMatched || matchedCount < requiredMatches) {
+        return { matched: false, score: 0 };
+    }
+    return { matched: true, score: totalScore / reqTokens.length };
+}
+
+// ================= IN-MEMORY CACHES (MINIMIZE DB CALLS) =================
+const AGENT_TTL = 120000;
+let agentCache = { list: null, at: 0 };
+async function getAgents(force = false) {
+    if (!force && agentCache.list && Date.now() - agentCache.at < AGENT_TTL) return agentCache.list;
+    const r = await pool.query('SELECT id, name, token, match_text, active FROM agents WHERE active = TRUE ORDER BY id');
+    agentCache = { list: r.rows, at: Date.now() };
+    return agentCache.list;
+}
+function invalidateAgentCache() { agentCache = { list: null, at: 0 }; }
+async function findAgentByToken(tk) {
+    if (!tk) return null;
+    return (await getAgents()).find(a => a.token === tk) || null;
+}
+async function findAgentByMsg(msg) {
+    return (await getAgents()).find(a => a.match_text && msg.includes(a.match_text)) || null;
+}
+
+const RECENT_TTL = 8000;
+const recentCache = new Map();
+function invalidateRecentCache() { recentCache.clear(); }
+
+// ================= SCHEMA BOOTSTRAP (RUNS ONCE ON STARTUP) =================
+let schemaReady = false;
+async function ensureSchema() {
+    if (schemaReady) return;
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS agents (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            token TEXT UNIQUE NOT NULL,
+            match_text TEXT,
+            active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        ALTER TABLE cbe_transactions ADD COLUMN IF NOT EXISTS agent_id INTEGER;
+        ALTER TABLE cbe_transactions ADD COLUMN IF NOT EXISTS recipient_account TEXT;
+        ALTER TABLE cbe_transactions ADD COLUMN IF NOT EXISTS claimed_by TEXT;
+        ALTER TABLE cbe_transactions ADD COLUMN IF NOT EXISTS claimed_txn_id TEXT;
+        ALTER TABLE cbe_transactions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+        ALTER TABLE telebirr_transactions ADD COLUMN IF NOT EXISTS agent_id INTEGER;
+        ALTER TABLE telebirr_transactions ADD COLUMN IF NOT EXISTS recipient_account TEXT;
+        ALTER TABLE telebirr_transactions ADD COLUMN IF NOT EXISTS claimed_by TEXT;
+        ALTER TABLE telebirr_transactions ADD COLUMN IF NOT EXISTS claimed_txn_id TEXT;
+        ALTER TABLE telebirr_transactions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+        CREATE TABLE IF NOT EXISTS agent_daily_audit (
+            audit_date DATE NOT NULL,
+            agent_id INTEGER NOT NULL DEFAULT 0,
+            bank TEXT NOT NULL,
+            total_in NUMERIC(14,2) NOT NULL DEFAULT 0,
+            total_out NUMERIC(14,2) NOT NULL DEFAULT 0,
+            atm_out NUMERIC(14,2) NOT NULL DEFAULT 0,
+            airtime_bill_out NUMERIC(14,2) NOT NULL DEFAULT 0,
+            tx_count INTEGER NOT NULL DEFAULT 0,
+            last_balance NUMERIC(14,2),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (audit_date, agent_id, bank)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cbe_payout_lookup ON cbe_transactions (status, tx_type, amount) WHERE status = 'Sent_Locked';
+        CREATE INDEX IF NOT EXISTS idx_tb_payout_lookup ON telebirr_transactions (status, tx_type, amount) WHERE status = 'Sent_Locked';
+    `);
+    schemaReady = true;
+}
+
+// ================= RETENTION PRUNE WITH DAILY AUDIT ROLLUP =================
+let lastAuditPruneAt = 0;
+async function runAuditAndPrune(days = RETENTION_DAYS) {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        for (const [bank, table] of [['CBE', 'cbe_transactions'], ['Telebirr', 'telebirr_transactions']]) {
+            const del = await client.query(
+                `DELETE FROM ${table}
+                 WHERE created_at < NOW() - ($1 || ' days')::interval
+                   AND status IN ('Used', 'Unused', 'Payout_Verified', 'Audit_Only')
+                 RETURNING COALESCE(agent_id, 0) AS agent_id, tx_type, category, amount, balance, (created_at AT TIME ZONE 'Africa/Addis_Ababa')::date AS d`,
+                [String(days)]
+            );
+            const buckets = new Map();
+            for (const row of del.rows) {
+                const k = `${row.d}|${row.agent_id}`;
+                if (!buckets.has(k)) {
+                    buckets.set(k, { d: row.d, agentId: row.agent_id, inAmt: 0, outAmt: 0, atmAmt: 0, billAmt: 0, count: 0, bal: null });
+                }
+                const b = buckets.get(k);
+                const amt = parseFloat(row.amount || 0);
+                b.count += 1;
+                if (row.tx_type === 'Received') b.inAmt += amt;
+                else {
+                    b.outAmt += amt;
+                    if (row.category === 'ATM/Card') b.atmAmt += amt;
+                    else if (row.category === 'Airtime' || row.category === 'Data' || row.category === 'Bill') b.billAmt += amt;
+                }
+                if (row.balance !== null && row.balance !== undefined) b.bal = parseFloat(row.balance);
+            }
+            for (const b of buckets.values()) {
+                await client.query(
+                    `INSERT INTO agent_daily_audit (audit_date, agent_id, bank, total_in, total_out, atm_out, airtime_bill_out, tx_count, last_balance, updated_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+                     ON CONFLICT (audit_date, agent_id, bank) DO UPDATE SET
+                       total_in = agent_daily_audit.total_in + EXCLUDED.total_in,
+                       total_out = agent_daily_audit.total_out + EXCLUDED.total_out,
+                       atm_out = agent_daily_audit.atm_out + EXCLUDED.atm_out,
+                       airtime_bill_out = agent_daily_audit.airtime_bill_out + EXCLUDED.airtime_bill_out,
+                       tx_count = agent_daily_audit.tx_count + EXCLUDED.tx_count,
+                       last_balance = COALESCE(EXCLUDED.last_balance, agent_daily_audit.last_balance),
+                       updated_at = NOW()`,
+                    [b.d, b.agentId, bank, b.inAmt, b.outAmt, b.atmAmt, b.billAmt, b.count, b.bal]
+                );
+            }
+        }
+        await client.query('COMMIT');
+        lastAuditPruneAt = Date.now();
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('audit/prune error:', e.message);
+    } finally {
+        client.release();
+    }
+}
+
+function maybeScheduleDailyPrune() {
+    if (Date.now() - lastAuditPruneAt > 24 * 60 * 60 * 1000) {
+        lastAuditPruneAt = Date.now();
+        setTimeout(() => runAuditAndPrune().catch(() => {}), 5000);
+    }
+}
+
+// ================= CBE RECEIPT RESOLVER (ZERO IDLE DB POLLING) =================
 function fetchHttps(hostname, path, headers) {
     return new Promise((resolve, reject) => {
         const req = https.request({
@@ -261,7 +405,7 @@ async function resolveFtNumber(v2Code, attempts = 1) {
                 const r = await fetchHttps(t.host, t.path, t.headers);
                 const m = r.body.match(/\b(FT[A-Z0-9]{8,15})\b/i);
                 if (m) return m[1].toUpperCase();
-            } catch (_) {}
+            } catch (e) {}
         }
         if (i < attempts - 1) await sleep(1500);
     }
@@ -274,16 +418,8 @@ const RESOLVE_EVERY = 30000;
 
 async function settleFt(id, ft) {
     try {
-        const u = await pool.query(
-            'UPDATE cbe_transactions SET ref_no=$1 WHERE id=$2 AND ref_no IS NULL RETURNING v2_code, claimed_txn_id',
-            [ft, id]
-        );
-        if (u.rows.length && u.rows[0].claimed_txn_id) {
-            await pool.query(
-                "UPDATE withdrawal_requests SET matched_ref=$1 WHERE txn_id=$2 AND matched_bank='CBE'",
-                [ft, u.rows[0].claimed_txn_id]
-            ).catch(() => {});
-        }
+        await pool.query('UPDATE cbe_transactions SET ref_no=$1 WHERE id=$2 AND ref_no IS NULL', [ft, id]);
+        invalidateRecentCache();
         return 'Resolved';
     } catch (e) {
         if (e.code === '23505') {
@@ -295,14 +431,14 @@ async function settleFt(id, ft) {
 }
 
 async function resolvePending() {
-    if (resolverBusy) return true;
+    if (resolverBusy) return false;
     resolverBusy = true;
     try {
         const { rows } = await pool.query(
             `SELECT id, v2_code FROM cbe_transactions
              WHERE ref_no IS NULL AND v2_code IS NOT NULL AND resolve_attempts < 40
-             ORDER BY id LIMIT 10`
-        );
+               AND COALESCE(category, 'Transfer') NOT IN ('ATM/Card', 'Airtime', 'Data', 'Bill')
+             ORDER BY id LIMIT 10`);
         if (!rows.length) return false;
         const failed = [];
         for (const row of rows) {
@@ -315,7 +451,7 @@ async function resolvePending() {
         return failed.length > 0 || rows.length === 10;
     } catch (e) {
         console.error('resolver:', e.message);
-        return true;
+        return false;
     } finally {
         resolverBusy = false;
     }
@@ -329,123 +465,56 @@ function scheduleResolve(ms = RESOLVE_EVERY) {
     }, ms);
 }
 
-// ================= AUTH & AGENT CACHE =================
-const AGENT_TTL = 60000;
-let agentCache = { list: null, at: 0 };
-function invalidateAgentCache() { agentCache = { list: null, at: 0 }; }
-
-async function getAgents(includeInactive = false) {
-    if (!includeInactive && agentCache.list && Date.now() - agentCache.at < AGENT_TTL) return agentCache.list;
-    const r = await pool.query('SELECT id, name, token, match_text, phone, cbe_account, notes, active, created_at FROM agents ORDER BY id');
-    const active = r.rows.filter(a => a.active);
-    agentCache = { list: active, at: Date.now() };
-    return includeInactive ? r.rows : active;
+// ================= AUTH HELPERS =================
+function readToken(req) {
+    return req.query.token || req.body?.token || '';
 }
 
-async function findAgentByToken(tk) {
-    if (!tk) return null;
-    return (await getAgents(false)).find(a => a.token === tk) || null;
-}
-
-async function findAgentByMsg(msg) {
-    return (await getAgents(false)).find(a => a.match_text && msg.includes(a.match_text)) || null;
-}
-
-async function getAgentNameById(id) {
-    if (!id) return 'Owner';
-    const all = await getAgents(true);
-    const a = all.find(x => Number(x.id) === Number(id));
-    return a ? a.name : 'Agent #' + id;
-}
-
-function auth(req, res) {
-    if (extractToken(req) !== SECRET_TOKEN) {
-        res.status(401).json({ status: 'Unauthorized' });
-        return false;
-    }
+function authAdmin(req, res) {
+    if (readToken(req) !== SECRET_TOKEN) { res.status(401).json({ status: 'Unauthorized' }); return false; }
     return true;
 }
 
 function authVerify(req, res) {
-    const t = extractToken(req);
-    if (t && (t === SECRET_TOKEN || (VERIFY_TOKEN && t === VERIFY_TOKEN))) return true;
+    const t = readToken(req);
+    if (t === SECRET_TOKEN || (VERIFY_TOKEN && t === VERIFY_TOKEN)) return true;
     res.status(401).json({ status: 'Unauthorized' });
     return false;
 }
 
-async function authOwnerOrAgent(req, res, allowVerifyToken = false) {
-    const t = extractToken(req);
-    if (!t) { res.status(401).json({ status: 'Unauthorized' }); return null; }
-    if (t === SECRET_TOKEN) return { role: 'owner', agent: null };
-    if (allowVerifyToken && VERIFY_TOKEN && t === VERIFY_TOKEN) return { role: 'owner', agent: null };
-    try {
-        const agent = await findAgentByToken(t);
-        if (!agent) { res.status(401).json({ status: 'Unauthorized' }); return null; }
-        return { role: 'agent', agent };
-    } catch (e) {
-        console.error(e);
-        res.status(500).json({ status: 'Database_Error' });
-        return null;
+async function resolveRoleByToken(token) {
+    if (!token) return null;
+    if (token === SECRET_TOKEN || (VERIFY_TOKEN && token === VERIFY_TOKEN)) {
+        return { isOwner: true, agentId: null, agentName: 'Owner' };
     }
+    const agent = await findAgentByToken(token);
+    if (agent) {
+        return { isOwner: false, agentId: agent.id, agentName: agent.name };
+    }
+    return null;
 }
 
-// ================= AUTO-MATCH WITHDRAWALS =================
-async function tryAutoMatchOpenWithdrawal({ table, txId, bank, amount, recipientAccount, ref, agentId }) {
-    if (!recipientAccount) return null;
-    const { rows } = await pool.query(
-        `SELECT id, txn_id, player_username, recipient_account, bank, agent_id
-         FROM withdrawal_requests
-         WHERE status = 'Open'
-           AND ABS(amount - $1) < 0.01
-           AND (bank IS NULL OR LOWER(bank) = LOWER($2))
-           AND (agent_id IS NULL OR $3::int IS NULL OR agent_id = $3::int)
-         ORDER BY created_at ASC, id ASC
-         LIMIT 25`,
-        [amount, bank, agentId || null]
-    );
-    const match = rows.find(r => accountsMatch(recipientAccount, r.recipient_account));
-    if (!match) return null;
-
-    const claimed = await pool.query(
-        `UPDATE ${table}
-         SET status = 'Payout_Verified',
-             claimed_by = COALESCE(NULLIF($2, ''), claimed_by),
-             claimed_txn_id = $3,
-             claimed_at = NOW()
-         WHERE id = $1 AND tx_type = 'Transferred' AND status = 'Sent_Locked'
-         RETURNING id, claimed_by, claimed_txn_id, claimed_at`,
-        [txId, match.player_username || '', match.txn_id]
-    );
-    if (!claimed.rows.length) return null;
-
-    await pool.query(
-        `UPDATE withdrawal_requests
-         SET status = 'Verified', matched_ref = $2, matched_bank = $3, agent_id = COALESCE($4, agent_id), verified_at = NOW()
-         WHERE id = $1`,
-        [match.id, ref || null, bank, agentId || null]
-    );
-    return {
-        claimed_by: claimed.rows[0].claimed_by || null,
-        claimed_txn_id: claimed.rows[0].claimed_txn_id,
-        claimed_at: claimed.rows[0].claimed_at
-    };
-}
-
-// ================= 1. SMS WEBHOOK (GET or POST) =================
+// ================= 1. SMS WEBHOOK (GET OR POST) =================
 async function handleWebhookSms(req, res) {
-    const actor = await authOwnerOrAgent(req, res, false);
-    if (!actor) return;
+    const token = readToken(req);
+    let agent = null;
+    if (token !== SECRET_TOKEN && (!VERIFY_TOKEN || token !== VERIFY_TOKEN)) {
+        try { agent = await findAgentByToken(token); }
+        catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
+        if (!agent) return res.status(401).json({ status: 'Unauthorized' });
+    }
 
-    const message = param(req, 'message');
-    const sender = param(req, 'sender');
+    const message = req.query.message ?? req.body?.message;
+    const sender = req.query.sender ?? req.body?.sender;
     if (!message) return res.status(400).json({ status: 'Error', message: 'No SMS provided' });
 
     const c = classify(message, sender);
-    if (!c.isIncoming && !c.isOutgoing) return res.json({ status: 'Ignored', reason: 'Not a payment SMS' });
+    if (!c.isIncoming && !c.isOutgoing) {
+        return res.json({ status: 'Ignored', reason: 'Not a payment SMS' });
+    }
 
-    let agent = actor.agent;
     if (!agent && c.isIncoming) {
-        try { agent = await findAgentByMsg(c.msg); } catch (e) { console.error(e); }
+        try { agent = await findAgentByMsg(c.msg); } catch (e) {}
     }
     const agentId = agent ? agent.id : null;
     const agentLabel = agent ? agent.name : 'Owner';
@@ -453,117 +522,64 @@ async function handleWebhookSms(req, res) {
     const amount = extractAmount(c.msg);
     const balance = extractBalance(c.msg);
     const party = extractParty(c.msg, c.isIncoming, c.bank);
-    const recipientAccount = extractRecipientAccount(c.msg, c.isIncoming, c.bank);
+    const recipientAccount = extractRecipientAccount(c.msg, c.isCbe);
     const category = detectCategory(c.msg, c.isIncoming);
-    let ref = null, v2 = null;
+    const isHuluBetEligible = !NON_HULUBET_CATEGORIES.includes(category);
 
+    let ref = null, v2 = null;
     if (c.isCbe) {
         ref = extractDirectFt(c.msg);
         v2 = extractV2Code(c.msg);
-        if (!ref && v2) ref = await resolveFtNumber(v2, 1);
+        if (!ref && v2 && isHuluBetEligible) ref = await resolveFtNumber(v2, 1);
         if (!ref && !v2) ref = 'CBE-' + crypto.createHash('sha1').update(c.msg).digest('hex').slice(0, 12).toUpperCase();
     } else {
         ref = extractTelebirrRef(c.msg);
-        if (!ref) return res.json({ status: 'Ignored', reason: 'Missing Ref', bank: c.bank, type: c.isIncoming ? 'Received' : 'Transferred' });
+        if (!ref) return res.json({ status: 'Ignored', reason: 'Missing Ref' });
     }
-    if (!amount) return res.json({ status: 'Ignored', reason: 'Missing Amount', bank: c.bank, ref: ref || v2 || null });
+    if (!amount) return res.json({ status: 'Ignored', reason: 'Missing Amount' });
 
     const txType = c.isIncoming ? 'Received' : 'Transferred';
-    const initialStatus = c.isIncoming ? 'Unused' : 'Sent_Locked';
-    const table = c.isCbe ? 'cbe_transactions' : 'telebirr_transactions';
+    // ATM/Airtime/Data/Bill are saved in DB for Agent cash/balance audit ('Audit_Only'),
+    // NEVER exposed to HuluBet deposit/withdrawal verification APIs.
+    const status = !isHuluBetEligible ? 'Audit_Only' : (c.isIncoming ? 'Unused' : 'Sent_Locked');
 
     try {
         let result;
         if (c.isCbe) {
             result = await pool.query(
-                `INSERT INTO cbe_transactions (tx_type, sender_name, amount, ref_no, raw_sms, status, category, balance, v2_code, recipient_account, agent_id)
+                `INSERT INTO cbe_transactions (tx_type, sender_name, amount, ref_no, raw_sms, status, category, balance, v2_code, agent_id, recipient_account)
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT DO NOTHING RETURNING id`,
-                [txType, party, amount, ref, c.msg, initialStatus, category, balance, v2, recipientAccount, agentId]
+                [txType, party, amount, ref, c.msg, status, category, balance, v2, agentId, recipientAccount]
             );
         } else {
             result = await pool.query(
-                `INSERT INTO telebirr_transactions (tx_type, sender_name, amount, ref_no, raw_sms, status, category, balance, recipient_account, agent_id)
+                `INSERT INTO telebirr_transactions (tx_type, sender_name, amount, ref_no, raw_sms, status, category, balance, agent_id, recipient_account)
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING RETURNING id`,
-                [txType, party, amount, ref, c.msg, initialStatus, category, balance, recipientAccount, agentId]
+                [txType, party, amount, ref, c.msg, status, category, balance, agentId, recipientAccount]
             );
         }
 
         if (result.rows.length === 0) {
-            const lookupCol = ref ? 'ref_no' : 'v2_code';
-            const lookupVal = ref || v2;
-            const ex = await pool.query(
-                `SELECT t.status, t.claimed_by, t.claimed_txn_id, t.agent_id, a.name AS agent_name
-                 FROM ${table} t LEFT JOIN agents a ON a.id = t.agent_id
-                 WHERE t.${lookupCol} = $1 LIMIT 1`,
-                [lookupVal]
-            ).catch(() => ({ rows: [] }));
-            const row = ex.rows[0];
             return res.json({
-                status: 'Duplicate',
-                bank: c.bank,
-                type: txType,
-                category,
-                ref: ref || v2,
-                amount,
-                balance,
-                party,
-                recipient_account: recipientAccount,
-                agent: row?.agent_name || agentLabel,
-                agent_id: row?.agent_id ?? agentId,
-                usage: row?.status || initialStatus,
-                claimed_by: row?.claimed_by || null,
-                claimed_txn_id: row?.claimed_txn_id || null
+                status: 'Duplicate', bank: c.bank, type: txType, category, ref: ref || v2,
+                amount, balance, party, recipient_account: recipientAccount, agent: agentLabel
             });
         }
 
-        const insertedId = result.rows[0].id;
-        let finalUsage = initialStatus;
-        let autoMatched = null;
-        if (!c.isIncoming) {
-            autoMatched = await tryAutoMatchOpenWithdrawal({
-                table, txId: insertedId, bank: c.bank, amount,
-                recipientAccount, ref: ref || v2, agentId
-            }).catch((e) => { console.error('auto-match:', e.message); return null; });
-            if (autoMatched) finalUsage = 'Payout_Verified';
-        }
+        invalidateRecentCache();
+        maybeScheduleDailyPrune();
 
-        if (c.isCbe && !ref) {
+        if (c.isCbe && !ref && isHuluBetEligible) {
             scheduleResolve(3000);
             return res.json({
-                status: 'Saved',
-                bank: c.bank,
-                type: txType,
-                category,
-                amount,
-                balance,
-                party,
-                recipient_account: recipientAccount,
-                agent: agentLabel,
-                agent_id: agentId,
-                usage: finalUsage,
-                claimed_by: autoMatched?.claimed_by || null,
-                claimed_txn_id: autoMatched?.claimed_txn_id || null,
-                ref: null,
-                resolving: true,
-                v2
+                status: 'Saved', bank: c.bank, type: txType, category, amount, balance,
+                party, recipient_account: recipientAccount, agent: agentLabel,
+                ref: null, resolving: true, v2
             });
         }
-
         return res.json({
-            status: 'Saved',
-            bank: c.bank,
-            type: txType,
-            category,
-            ref,
-            amount,
-            balance,
-            party,
-            recipient_account: recipientAccount,
-            agent: agentLabel,
-            agent_id: agentId,
-            usage: finalUsage,
-            claimed_by: autoMatched?.claimed_by || null,
-            claimed_txn_id: autoMatched?.claimed_txn_id || null
+            status: 'Saved', bank: c.bank, type: txType, category, ref, amount,
+            balance, party, recipient_account: recipientAccount, agent: agentLabel
         });
     } catch (err) {
         console.error(err);
@@ -573,121 +589,62 @@ async function handleWebhookSms(req, res) {
 app.get('/webhook/sms', handleWebhookSms);
 app.post('/webhook/sms', handleWebhookSms);
 
-// ================= 2. CBE MANUAL FT / PENDING LIST =================
-app.get('/api/cbe/resolve', async (req, res) => {
-    if (!auth(req, res)) return;
-    const m = String(req.query.v2 || '').match(/v2-[A-Za-z0-9_-]+/i);
-    const ft = String(req.query.ft || '').trim().toUpperCase();
-    if (!m) return res.json({ status: 'Missing_V2' });
-    if (!/^FT[A-Z0-9]{8,15}$/.test(ft)) return res.json({ status: 'Invalid_FT' });
-    try {
-        const r = await pool.query('SELECT id FROM cbe_transactions WHERE v2_code=$1 AND ref_no IS NULL', [normV2(m[0])]);
-        if (!r.rows.length) return res.json({ status: 'Not_Pending' });
-        return res.json({ status: await settleFt(r.rows[0].id, ft), ref_no: ft });
-    } catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
-});
-
-app.get('/api/cbe/pending', async (req, res) => {
-    if (!auth(req, res)) return;
-    try {
-        const r = await pool.query(
-            `SELECT id, v2_code, amount, sender_name, agent_id, resolve_attempts AS attempts
-             FROM cbe_transactions WHERE ref_no IS NULL ORDER BY id DESC LIMIT 50`
-        );
-        return res.json({ status: 'OK', count: r.rows.length, items: r.rows });
-    } catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
-});
-
-app.get('/api/cbe/debug', async (req, res) => {
-    if (!auth(req, res)) return;
-    const m = String(req.query.v2 || '').match(/v2-[A-Za-z0-9_-]+/i);
-    if (!m) return res.json({ status: 'Missing_V2' });
-    const out = [];
-    for (const t of cbeTargets(m[0])) {
-        try {
-            const r = await fetchHttps(t.host, t.path, t.headers);
-            const ft = r.body.match(/\b(FT[A-Z0-9]{8,15})\b/i);
-            out.push({ target: t.name, http: r.status, bytes: r.body.length, ft: ft ? ft[1].toUpperCase() : null, body: r.body.replace(/\s+/g, ' ').slice(0, 400) });
-        } catch (e) { out.push({ target: t.name, error: e.message }); }
-    }
-    return res.json({ status: 'OK', results: out });
-});
-
-// ================= 3. DEPOSIT VERIFY (HuluBet) =================
-async function tryUse(table, col, val, amount, claimedBy, claimedTxnId) {
+// ================= 2. DEPOSIT VERIFICATION (/api/verify) =================
+async function tryUseDeposit(table, col, val, amount, claimedBy) {
     const r = await pool.query(
         `UPDATE ${table}
-         SET status = 'Used',
-             claimed_by = COALESCE(NULLIF($3, ''), claimed_by),
-             claimed_txn_id = COALESCE(NULLIF($4, ''), claimed_txn_id),
-             claimed_at = NOW()
-         WHERE ${col} = $1
-           AND tx_type = 'Received'
-           AND status = 'Unused'
-           AND ref_no IS NOT NULL
-           AND ABS(amount - $2) < 0.01
-         RETURNING amount, ref_no, sender_name, agent_id, claimed_by, claimed_txn_id`,
-        [val, amount, claimedBy || '', claimedTxnId || '']
+         SET status='Used', claimed_by=COALESCE($3, claimed_by)
+         WHERE ${col}=$1 AND tx_type='Received' AND status='Unused'
+           AND COALESCE(category, 'Received') NOT IN ('ATM/Card', 'Airtime', 'Data', 'Bill')
+           AND ref_no IS NOT NULL AND ABS(amount-$2) < 0.01
+         RETURNING amount, ref_no, sender_name, agent_id`,
+        [val, amount, claimedBy || null]
     );
     return r.rows[0] || null;
 }
 
-async function whyNot(table, col, val, bank, expected) {
-    const r = await pool.query(
-        `SELECT t.tx_type, t.ref_no, t.status, t.amount, t.claimed_by, t.claimed_txn_id, t.agent_id, a.name AS agent_name
-         FROM ${table} t LEFT JOIN agents a ON a.id = t.agent_id
-         WHERE t.${col} = $1`,
-        [val]
-    );
+async function whyDepositNotMatched(table, col, val, bank, expected) {
+    const r = await pool.query(`SELECT tx_type, ref_no, status, amount, category FROM ${table} WHERE ${col}=$1`, [val]);
     if (!r.rows.length) return { status: 'Pending', bank };
     const tx = r.rows[0];
-    if (tx.tx_type !== 'Received') return { status: 'Invalid_Transaction_Type', bank };
-    if (!tx.ref_no) return { status: 'Resolving', bank };
-    if (tx.status !== 'Unused') {
-        return {
-            status: 'AlreadyUsed',
-            bank,
-            claimed_by: tx.claimed_by || null,
-            claimed_txn_id: tx.claimed_txn_id || null,
-            agent_id: tx.agent_id || null,
-            agent: tx.agent_name || (tx.agent_id ? 'Agent #' + tx.agent_id : 'Owner')
-        };
+    if (NON_HULUBET_CATEGORIES.includes(tx.category) || tx.tx_type !== 'Received') {
+        return { status: 'Invalid_Transaction_Type', bank };
     }
+    if (!tx.ref_no) return { status: 'Resolving', bank };
+    if (tx.status !== 'Unused') return { status: 'AlreadyUsed', bank };
     return { status: 'InvalidAmount', expected, actual: parseFloat(tx.amount), bank };
 }
 
-async function handleVerifyDeposit(req, res) {
+app.get('/api/verify', async (req, res) => {
     if (!authVerify(req, res)) return;
-    const inp = parseVerifyInput(param(req, 'ref'), param(req, 'sms') || param(req, 'text'));
+    const inp = parseVerifyInput(req.query.ref, req.query.sms || req.query.text);
     if (!inp) return res.json({ status: 'Missing_Ref' });
-
-    let expected = parseFloat(param(req, 'amount'));
+    let expected = parseFloat(req.query.amount);
     if (isNaN(expected) && inp.amount) expected = inp.amount;
     if (isNaN(expected) || expected <= 0) return res.json({ status: 'Missing_Amount' });
 
-    const claimedBy = String(param(req, 'claimed_by') || param(req, 'player') || '').trim();
-    const claimedTxnId = String(param(req, 'claimed_txn_id') || param(req, 'txn_id') || '').trim();
-
+    const claimedBy = (req.query.username || req.query.claimed_by || '').toString().trim() || null;
     const isTb = inp.type === 'tb';
     const table = isTb ? 'telebirr_transactions' : 'cbe_transactions';
     const bank = isTb ? 'Telebirr' : 'CBE';
     let col = (inp.type === 'v2') ? 'v2_code' : 'ref_no';
     let val = inp.value;
 
-    const done = async (tx) => res.json({
-        status: 'Verified',
-        bank,
-        amount: parseFloat(tx.amount),
-        ref_no: tx.ref_no,
-        from_to: tx.sender_name,
-        agent_id: tx.agent_id || null,
-        agent: await getAgentNameById(tx.agent_id),
-        claimed_by: tx.claimed_by || claimedBy || null,
-        claimed_txn_id: tx.claimed_txn_id || claimedTxnId || null
-    });
+    const done = async (tx) => {
+        invalidateRecentCache();
+        let agentName = 'Owner';
+        if (tx.agent_id) {
+            const ag = (await getAgents().catch(() => [])).find(a => a.id === tx.agent_id);
+            if (ag) agentName = ag.name;
+        }
+        return res.json({
+            status: 'Verified', bank, amount: parseFloat(tx.amount),
+            ref_no: tx.ref_no, from_to: tx.sender_name, agent: agentName, agent_id: tx.agent_id || null
+        });
+    };
 
     try {
-        let tx = await tryUse(table, col, val, expected, claimedBy, claimedTxnId);
+        let tx = await tryUseDeposit(table, col, val, expected, claimedBy);
         if (tx) return await done(tx);
 
         if (inp.type === 'v2') {
@@ -697,318 +654,178 @@ async function handleVerifyDeposit(req, res) {
                 if (ft) {
                     if (r.rows.length) await settleFt(r.rows[0].id, ft).catch(() => {});
                     col = 'ref_no'; val = ft;
-                    tx = await tryUse(table, col, val, expected, claimedBy, claimedTxnId);
+                    tx = await tryUseDeposit(table, col, val, expected, claimedBy);
                     if (tx) return await done(tx);
                 }
             }
         }
-        return res.json(await whyNot(table, col, val, bank, expected));
+        return res.json(await whyDepositNotMatched(table, col, val, bank, expected));
     } catch (err) {
         console.error(err);
         return res.status(500).json({ status: 'System_Busy' });
     }
-}
-app.get('/api/verify', handleVerifyDeposit);
-app.post('/api/verify', handleVerifyDeposit);
-
-// ================= 4. WITHDRAWAL VERIFY & REQUESTS (HuluBet) =================
-async function claimOutgoingRow(table, rowId, claimedBy, claimedTxnId) {
-    const r = await pool.query(
-        `UPDATE ${table}
-         SET status = 'Payout_Verified',
-             claimed_by = COALESCE(NULLIF($2, ''), claimed_by),
-             claimed_txn_id = COALESCE(NULLIF($3, ''), claimed_txn_id),
-             claimed_at = NOW()
-         WHERE id = $1 AND tx_type = 'Transferred' AND status = 'Sent_Locked'
-         RETURNING id, tx_type, amount, ref_no, sender_name, recipient_account, agent_id, claimed_by, claimed_txn_id, claimed_at`,
-        [rowId, claimedBy || '', claimedTxnId || '']
-    );
-    return r.rows[0] || null;
-}
-
-async function handleVerifyWithdrawal(req, res) {
-    if (!authVerify(req, res)) return;
-
-    const txnId = String(param(req, 'txn_id') || param(req, 'claimed_txn_id') || '').trim();
-    const claimedBy = String(param(req, 'claimed_by') || param(req, 'player') || '').trim();
-    const recipientAcc = String(param(req, 'recipient_account') || param(req, 'account') || param(req, 'phone') || '').trim();
-    const refIn = param(req, 'ref') || param(req, 'sms') || param(req, 'text');
-    const bankIn = String(param(req, 'bank') || '').trim();
-    const agentIdRaw = parseInt(param(req, 'agent_id'), 10);
-    const agentId = isNaN(agentIdRaw) ? null : agentIdRaw;
-    const strictAccount = String(param(req, 'strict_account') || 'true').toLowerCase() !== 'false';
-    const windowHours = Math.min(Math.max(parseInt(param(req, 'window_hours'), 10) || 72, 1), 720);
-    const sinceRaw = param(req, 'since');
-    const sinceDate = sinceRaw && !isNaN(Date.parse(sinceRaw)) ? new Date(sinceRaw) : null;
-
-    let expected = parseFloat(param(req, 'amount'));
-    const hasExpected = !isNaN(expected) && expected > 0;
-
-    try {
-        // Mode A: Manual ref / full SMS provided
-        if (refIn) {
-            const inp = parseVerifyInput(refIn, refIn);
-            if (!inp) return res.json({ status: 'Invalid_Ref' });
-            if (!hasExpected && inp.amount > 0) expected = inp.amount;
-
-            const t = await locate(inp);
-            const found = await pool.query(`SELECT * FROM ${t.table} WHERE ${t.col} = $1 LIMIT 1`, [t.val]);
-            if (!found.rows.length) return res.json({ status: 'Pending', bank: t.bank });
-            const row = found.rows[0];
-            if (row.tx_type !== 'Transferred') return res.json({ status: 'Invalid_Transaction_Type', bank: t.bank });
-            if (row.status === 'Payout_Verified') {
-                return res.json({
-                    status: row.claimed_txn_id && txnId && row.claimed_txn_id === txnId ? 'Verified' : 'Already_Verified',
-                    bank: t.bank,
-                    ref_no: row.ref_no || row.v2_code,
-                    amount: parseFloat(row.amount),
-                    recipient_account: row.recipient_account || null,
-                    agent_id: row.agent_id || null,
-                    agent: await getAgentNameById(row.agent_id),
-                    claimed_by: row.claimed_by || null,
-                    claimed_txn_id: row.claimed_txn_id || null
-                });
-            }
-            if (row.status !== 'Sent_Locked') return res.json({ status: 'Invalid_Status', usage: row.status, bank: t.bank });
-            if (!isNaN(expected) && expected > 0 && Math.abs(parseFloat(row.amount) - expected) >= 0.01) {
-                return res.json({ status: 'InvalidAmount', expected, actual: parseFloat(row.amount), bank: t.bank });
-            }
-            if (strictAccount && recipientAcc && row.recipient_account && !accountsMatch(row.recipient_account, recipientAcc)) {
-                return res.json({
-                    status: 'Account_Mismatch',
-                    expected_account: recipientAcc,
-                    sms_account: row.recipient_account,
-                    bank: t.bank
-                });
-            }
-
-            const claimed = await claimOutgoingRow(t.table, row.id, claimedBy, txnId);
-            if (!claimed) return res.json({ status: 'Already_Verified', bank: t.bank });
-
-            if (txnId) {
-                await pool.query(
-                    `UPDATE withdrawal_requests
-                     SET status = 'Verified', matched_ref = $2, matched_bank = $3, agent_id = COALESCE($4, agent_id), verified_at = NOW()
-                     WHERE txn_id = $1`,
-                    [txnId, claimed.ref_no || row.v2_code || null, t.bank, claimed.agent_id]
-                );
-            }
-
-            return res.json({
-                status: 'Verified',
-                bank: t.bank,
-                ref_no: claimed.ref_no || row.v2_code,
-                amount: parseFloat(claimed.amount),
-                party: claimed.sender_name,
-                recipient_account: claimed.recipient_account || null,
-                agent_id: claimed.agent_id || null,
-                agent: await getAgentNameById(claimed.agent_id),
-                claimed_by: claimed.claimed_by || null,
-                claimed_txn_id: claimed.claimed_txn_id || null,
-                verified_at: claimed.claimed_at
-            });
-        }
-
-        // Mode B: Auto-match by amount + recipient_account
-        if (isNaN(expected) || expected <= 0) return res.json({ status: 'Missing_Amount' });
-        if (!recipientAcc) return res.json({ status: 'Missing_Recipient_Account' });
-
-        const tables = [];
-        if (!bankIn || /telebirr/i.test(bankIn)) tables.push({ bank: 'Telebirr', table: 'telebirr_transactions' });
-        if (!bankIn || /cbe/i.test(bankIn)) tables.push({ bank: 'CBE', table: 'cbe_transactions' });
-        if (!tables.length) return res.json({ status: 'Invalid_Bank' });
-
-        for (const t of tables) {
-            const { rows } = await pool.query(
-                `SELECT id, amount, ref_no, ${t.bank === 'CBE' ? 'v2_code,' : ''} sender_name, recipient_account, agent_id, created_at
-                 FROM ${t.table}
-                 WHERE tx_type = 'Transferred'
-                   AND status = 'Sent_Locked'
-                   AND ABS(amount - $1) < 0.01
-                   AND created_at >= NOW() - make_interval(hours => $2)
-                   AND ($3::timestamptz IS NULL OR created_at >= $3::timestamptz)
-                   AND ($4::int IS NULL OR agent_id = $4::int)
-                 ORDER BY created_at DESC, id DESC
-                 LIMIT 30`,
-                [expected, windowHours, sinceDate, agentId]
-            );
-            const matched = rows.find(r => r.recipient_account && accountsMatch(r.recipient_account, recipientAcc));
-            if (!matched) continue;
-
-            const claimed = await claimOutgoingRow(t.table, matched.id, claimedBy, txnId);
-            if (!claimed) continue;
-
-            if (txnId) {
-                await pool.query(
-                    `UPDATE withdrawal_requests
-                     SET status = 'Verified', matched_ref = $2, matched_bank = $3, agent_id = COALESCE($4, agent_id), verified_at = NOW()
-                     WHERE txn_id = $1`,
-                    [txnId, claimed.ref_no || matched.v2_code || null, t.bank, claimed.agent_id]
-                );
-            }
-
-            return res.json({
-                status: 'Verified',
-                bank: t.bank,
-                ref_no: claimed.ref_no || matched.v2_code || null,
-                amount: parseFloat(claimed.amount),
-                party: claimed.sender_name,
-                recipient_account: claimed.recipient_account || null,
-                agent_id: claimed.agent_id || null,
-                agent: await getAgentNameById(claimed.agent_id),
-                claimed_by: claimed.claimed_by || null,
-                claimed_txn_id: claimed.claimed_txn_id || null,
-                verified_at: claimed.claimed_at
-            });
-        }
-
-        return res.json({ status: 'Pending', expected, recipient_account: recipientAcc, bank: bankIn || 'Any' });
-    } catch (e) {
-        console.error(e);
-        return res.status(500).json({ status: 'Database_Error' });
-    }
-}
-app.get('/api/verify-withdrawal', handleVerifyWithdrawal);
-app.post('/api/verify-withdrawal', handleVerifyWithdrawal);
-
-async function handleWithdrawalRequest(req, res) {
-    if (!authVerify(req, res)) return;
-    const txnId = String(param(req, 'txn_id') || '').trim();
-    const amount = parseFloat(param(req, 'amount'));
-    const recipientAcc = String(param(req, 'recipient_account') || param(req, 'account') || param(req, 'phone') || '').trim();
-    const bankIn = String(param(req, 'bank') || '').trim() || null;
-    const playerUsername = String(param(req, 'player_username') || param(req, 'claimed_by') || '').trim() || null;
-    const agentIdRaw = parseInt(param(req, 'agent_id'), 10);
-    const agentId = isNaN(agentIdRaw) ? null : agentIdRaw;
-
-    if (!txnId) return res.json({ status: 'Missing_Txn_Id' });
-    if (isNaN(amount) || amount <= 0) return res.json({ status: 'Missing_Amount' });
-    if (!recipientAcc) return res.json({ status: 'Missing_Recipient_Account' });
-
-    try {
-        const tables = [];
-        if (!bankIn || /telebirr/i.test(bankIn)) tables.push({ bank: 'Telebirr', table: 'telebirr_transactions' });
-        if (!bankIn || /cbe/i.test(bankIn)) tables.push({ bank: 'CBE', table: 'cbe_transactions' });
-
-        for (const t of tables) {
-            const { rows } = await pool.query(
-                `SELECT id, amount, ref_no, ${t.bank === 'CBE' ? 'v2_code,' : ''} sender_name, recipient_account, agent_id
-                 FROM ${t.table}
-                 WHERE tx_type = 'Transferred'
-                   AND status = 'Sent_Locked'
-                   AND ABS(amount - $1) < 0.01
-                   AND created_at >= NOW() - INTERVAL '48 hours'
-                   AND ($2::int IS NULL OR agent_id = $2::int)
-                 ORDER BY created_at DESC, id DESC LIMIT 25`,
-                [amount, agentId]
-            );
-            const matched = rows.find(r => r.recipient_account && accountsMatch(r.recipient_account, recipientAcc));
-            if (!matched) continue;
-
-            const claimed = await claimOutgoingRow(t.table, matched.id, playerUsername || '', txnId);
-            if (!claimed) continue;
-
-            await pool.query(
-                `INSERT INTO withdrawal_requests (txn_id, bank, amount, recipient_account, player_username, agent_id, status, matched_ref, matched_bank, verified_at)
-                 VALUES ($1,$2,$3,$4,$5,$6,'Verified',$7,$8,NOW())
-                 ON CONFLICT (txn_id) DO UPDATE
-                 SET status='Verified', matched_ref=EXCLUDED.matched_ref, matched_bank=EXCLUDED.matched_bank,
-                     agent_id=COALESCE(EXCLUDED.agent_id, withdrawal_requests.agent_id), verified_at=NOW()`,
-                [txnId, bankIn, amount, recipientAcc, playerUsername, claimed.agent_id || agentId, claimed.ref_no || matched.v2_code || null, t.bank]
-            );
-
-            return res.json({
-                status: 'Already_Matched_Verified',
-                txn_id: txnId,
-                bank: t.bank,
-                ref_no: claimed.ref_no || matched.v2_code || null,
-                amount: parseFloat(claimed.amount),
-                recipient_account: claimed.recipient_account || null,
-                agent_id: claimed.agent_id || null,
-                agent: await getAgentNameById(claimed.agent_id),
-                claimed_by: claimed.claimed_by || null,
-                claimed_txn_id: claimed.claimed_txn_id
-            });
-        }
-
-        await pool.query(
-            `INSERT INTO withdrawal_requests (txn_id, bank, amount, recipient_account, player_username, agent_id, status)
-             VALUES ($1,$2,$3,$4,$5,$6,'Open')
-             ON CONFLICT (txn_id) DO UPDATE
-             SET bank=COALESCE(EXCLUDED.bank, withdrawal_requests.bank),
-                 amount=EXCLUDED.amount,
-                 recipient_account=EXCLUDED.recipient_account,
-                 player_username=COALESCE(EXCLUDED.player_username, withdrawal_requests.player_username),
-                 agent_id=COALESCE(EXCLUDED.agent_id, withdrawal_requests.agent_id)`,
-            [txnId, bankIn, amount, recipientAcc, playerUsername, agentId]
-        );
-        return res.json({ status: 'Queued', txn_id: txnId, bank: bankIn, amount, recipient_account: recipientAcc });
-    } catch (e) {
-        console.error(e);
-        return res.status(500).json({ status: 'Database_Error' });
-    }
-}
-app.get('/api/withdrawal-request', handleWithdrawalRequest);
-app.post('/api/withdrawal-request', handleWithdrawalRequest);
-
-app.get('/api/check-withdrawal', async (req, res) => {
-    if (!authVerify(req, res)) return;
-    const txnId = String(param(req, 'txn_id') || '').trim();
-    if (!txnId) return res.json({ status: 'Missing_Txn_Id' });
-    try {
-        const r = await pool.query(
-            `SELECT w.*, a.name AS agent_name
-             FROM withdrawal_requests w LEFT JOIN agents a ON a.id = w.agent_id
-             WHERE w.txn_id = $1`,
-            [txnId]
-        );
-        if (r.rows.length) {
-            const x = r.rows[0];
-            return res.json({
-                status: x.status === 'Verified' ? 'Verified' : x.status,
-                txn_id: x.txn_id,
-                bank: x.matched_bank || x.bank,
-                amount: parseFloat(x.amount),
-                recipient_account: x.recipient_account,
-                claimed_by: x.player_username || null,
-                claimed_txn_id: x.txn_id,
-                ref_no: x.matched_ref || null,
-                agent_id: x.agent_id || null,
-                agent: x.agent_name || (x.agent_id ? 'Agent #' + x.agent_id : 'Owner'),
-                verified_at: x.verified_at || null
-            });
-        }
-        const tRes = await pool.query(
-            `SELECT 'CBE' AS bank, ref_no, amount, recipient_account, claimed_by, claimed_txn_id, agent_id, claimed_at
-             FROM cbe_transactions WHERE claimed_txn_id = $1
-             UNION ALL
-             SELECT 'Telebirr' AS bank, ref_no, amount, recipient_account, claimed_by, claimed_txn_id, agent_id, claimed_at
-             FROM telebirr_transactions WHERE claimed_txn_id = $1
-             LIMIT 1`,
-            [txnId]
-        );
-        if (!tRes.rows.length) return res.json({ status: 'Not_Found', txn_id: txnId });
-        const row = tRes.rows[0];
-        return res.json({
-            status: 'Verified',
-            txn_id: txnId,
-            bank: row.bank,
-            amount: parseFloat(row.amount),
-            recipient_account: row.recipient_account || null,
-            claimed_by: row.claimed_by || null,
-            claimed_txn_id: row.claimed_txn_id,
-            ref_no: row.ref_no,
-            agent_id: row.agent_id || null,
-            agent: await getAgentNameById(row.agent_id),
-            verified_at: row.claimed_at || null
-        });
-    } catch (e) {
-        console.error(e);
-        return res.status(500).json({ status: 'Database_Error' });
-    }
 });
 
-// ================= 5. READ-ONLY CHECK & RECENT (Owner OR Agent) =================
+// ================= 3. WITHDRAWAL VERIFICATION (REF OR FUZZY NAME + AMOUNT) =================
+async function handleVerifyWithdrawal(req, res, lockMatch) {
+    if (!authVerify(req, res)) return;
+
+    const refRaw = (req.query.ref || req.body?.ref || '').toString().trim();
+    const customerName = (req.query.name || req.query.customer_name || req.query.full_name || req.query.recipient_name || req.body?.name || req.body?.customer_name || '').toString().trim();
+    const withdrawalId = (req.query.withdrawal_id || req.query.txn_id || req.body?.withdrawal_id || req.body?.txn_id || '').toString().trim() || null;
+    const bankFilter = (req.query.bank || req.body?.bank || '').toString().trim().toLowerCase();
+    const expected = parseFloat(req.query.amount ?? req.body?.amount);
+    const hours = Math.min(Math.max(parseInt(req.query.hours || req.body?.hours || '72', 10) || 72, 1), 720);
+    const agentIdFilter = req.query.agent_id ? parseInt(req.query.agent_id, 10) : null;
+
+    if (!refRaw && (!customerName || isNaN(expected) || expected <= 0)) {
+        return res.json({ status: 'Missing_Params', message: 'Provide ref OR (name + amount)' });
+    }
+
+    const agents = await getAgents().catch(() => []);
+    const agentNameFor = (aid) => {
+        if (!aid) return 'Owner';
+        const ag = agents.find(a => a.id === aid);
+        return ag ? ag.name : `Agent ${aid}`;
+    };
+
+    try {
+        if (withdrawalId) {
+            for (const [bName, tbl] of [['CBE', 'cbe_transactions'], ['Telebirr', 'telebirr_transactions']]) {
+                const prev = await pool.query(
+                    `SELECT id, amount, ref_no, sender_name, agent_id, claimed_txn_id FROM ${tbl} WHERE claimed_txn_id=$1 AND status='Payout_Verified' LIMIT 1`,
+                    [withdrawalId]
+                );
+                if (prev.rows.length) {
+                    const p = prev.rows[0];
+                    return res.json({
+                        status: 'Payout_Verified', already_verified: true, bank: bName,
+                        amount: parseFloat(p.amount), ref_no: p.ref_no, party: p.sender_name,
+                        agent: agentNameFor(p.agent_id), claimed_txn_id: p.claimed_txn_id
+                    });
+                }
+            }
+        }
+
+        if (refRaw) {
+            const inp = parseVerifyInput(refRaw, null);
+            if (!inp) return res.json({ status: 'Missing_Ref' });
+            const isTb = inp.type === 'tb';
+            const table = isTb ? 'telebirr_transactions' : 'cbe_transactions';
+            const bank = isTb ? 'Telebirr' : 'CBE';
+            const col = inp.type === 'v2' ? 'v2_code' : 'ref_no';
+
+            const found = await pool.query(
+                `SELECT id, tx_type, status, category, amount, ref_no, sender_name, agent_id, claimed_txn_id FROM ${table} WHERE ${col}=$1 LIMIT 1`,
+                [inp.value]
+            );
+            if (!found.rows.length) return res.json({ status: 'Not_Found', bank });
+            const row = found.rows[0];
+            if (NON_HULUBET_CATEGORIES.includes(row.category) || row.tx_type !== 'Transferred') {
+                return res.json({ status: 'Invalid_Transaction_Type', bank });
+            }
+            if (!isNaN(expected) && expected > 0 && Math.abs(parseFloat(row.amount) - expected) >= 0.01) {
+                return res.json({ status: 'InvalidAmount', expected, actual: parseFloat(row.amount), bank });
+            }
+            if (row.status === 'Payout_Verified') {
+                return res.json({ status: 'AlreadyVerified', bank, ref_no: row.ref_no, claimed_txn_id: row.claimed_txn_id });
+            }
+            if (row.status !== 'Sent_Locked') {
+                return res.json({ status: 'Invalid_Status', actual_status: row.status, bank });
+            }
+            if (!lockMatch) {
+                return res.json({
+                    status: 'Match_Found', bank, amount: parseFloat(row.amount),
+                    ref_no: row.ref_no, party: row.sender_name, agent: agentNameFor(row.agent_id), match_score: 1.0
+                });
+            }
+            const upd = await pool.query(
+                `UPDATE ${table} SET status='Payout_Verified', claimed_txn_id=COALESCE($2, claimed_txn_id), claimed_by=COALESCE($3, claimed_by)
+                 WHERE id=$1 AND status='Sent_Locked' RETURNING amount, ref_no, sender_name, agent_id, claimed_txn_id`,
+                [row.id, withdrawalId, customerName || null]
+            );
+            if (!upd.rows.length) return res.json({ status: 'AlreadyVerified', bank });
+            invalidateRecentCache();
+            const u = upd.rows[0];
+            return res.json({
+                status: 'Payout_Verified', bank, amount: parseFloat(u.amount),
+                ref_no: u.ref_no, party: u.sender_name, agent: agentNameFor(u.agent_id),
+                claimed_txn_id: u.claimed_txn_id, match_score: 1.0
+            });
+        }
+
+        const tables = bankFilter === 'cbe'
+            ? [['CBE', 'cbe_transactions']]
+            : bankFilter === 'telebirr'
+                ? [['Telebirr', 'telebirr_transactions']]
+                : [['CBE', 'cbe_transactions'], ['Telebirr', 'telebirr_transactions']];
+
+        const candidates = [];
+        for (const [bName, tbl] of tables) {
+            const q = await pool.query(
+                `SELECT id, amount, ref_no, sender_name, agent_id, created_at
+                 FROM ${tbl}
+                 WHERE status = 'Sent_Locked'
+                   AND tx_type = 'Transferred'
+                   AND COALESCE(category, 'Transfer') NOT IN ('ATM/Card', 'Airtime', 'Data', 'Bill')
+                   AND ABS(amount - $1) < 0.01
+                   AND created_at >= NOW() - ($2 || ' hours')::interval
+                   ${agentIdFilter !== null && !isNaN(agentIdFilter) ? 'AND agent_id = $3' : ''}
+                 ORDER BY id DESC LIMIT 25`,
+                agentIdFilter !== null && !isNaN(agentIdFilter) ? [expected, String(hours), agentIdFilter] : [expected, String(hours)]
+            );
+            for (const r of q.rows) {
+                const m = scoreNameMatch(customerName, r.sender_name);
+                if (m.matched) {
+                    candidates.push({ table: tbl, bank: bName, row: r, score: m.score });
+                }
+            }
+        }
+
+        if (!candidates.length) {
+            return res.json({ status: 'Not_Found', amount: expected, looked_for_name: customerName });
+        }
+
+        candidates.sort((a, b) => b.score - a.score || a.row.id - b.row.id);
+        const best = candidates[0];
+
+        if (!lockMatch) {
+            return res.json({
+                status: 'Match_Found', bank: best.bank, amount: parseFloat(best.row.amount),
+                ref_no: best.row.ref_no, party: best.row.sender_name,
+                agent: agentNameFor(best.row.agent_id), match_score: Number(best.score.toFixed(2)),
+                candidates_count: candidates.length
+            });
+        }
+
+        const upd = await pool.query(
+            `UPDATE ${best.table}
+             SET status='Payout_Verified', claimed_txn_id=COALESCE($2, claimed_txn_id), claimed_by=COALESCE($3, claimed_by)
+             WHERE id=$1 AND status='Sent_Locked'
+             RETURNING amount, ref_no, sender_name, agent_id, claimed_txn_id`,
+            [best.row.id, withdrawalId, customerName]
+        );
+        if (!upd.rows.length) {
+            return res.json({ status: 'System_Busy', message: 'Matched payout was claimed concurrently; retry' });
+        }
+        invalidateRecentCache();
+        const u = upd.rows[0];
+        return res.json({
+            status: 'Payout_Verified', bank: best.bank, amount: parseFloat(u.amount),
+            ref_no: u.ref_no, party: u.sender_name, agent: agentNameFor(u.agent_id),
+            claimed_txn_id: u.claimed_txn_id, match_score: Number(best.score.toFixed(2))
+        });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ status: 'Database_Error' });
+    }
+}
+
+app.get('/api/verify-withdrawal', (req, res) => handleVerifyWithdrawal(req, res, true));
+app.post('/api/verify-withdrawal', (req, res) => handleVerifyWithdrawal(req, res, true));
+app.get('/api/check-withdrawal', (req, res) => handleVerifyWithdrawal(req, res, false));
+
+// ================= 4. RECENT & CHECK (OWNER SEES ALL, AGENT SEES OWN) =================
 async function locate(inp) {
     if (inp.type === 'tb') return { table: 'telebirr_transactions', col: 'ref_no', val: inp.value, bank: 'Telebirr' };
     const o = { table: 'cbe_transactions', bank: 'CBE', col: 'ref_no', val: inp.value };
@@ -1024,287 +841,211 @@ async function locate(inp) {
 }
 
 app.get('/api/check', async (req, res) => {
-    const actor = await authOwnerOrAgent(req, res, true);
-    if (!actor) return;
+    const role = await resolveRoleByToken(readToken(req)).catch(() => null);
+    if (!role) return res.status(401).json({ status: 'Unauthorized' });
     const inp = parseVerifyInput(req.query.ref, req.query.sms || req.query.text);
     if (!inp) return res.json({ status: 'Missing_Ref' });
 
     try {
         const t = await locate(inp);
-        const whereAgent = actor.agent ? 'AND t.agent_id = $2' : '';
-        const args = actor.agent ? [t.val, actor.agent.id] : [t.val];
         const r = await pool.query(
-            `SELECT t.*, a.name AS agent_name
-             FROM ${t.table} t LEFT JOIN agents a ON a.id = t.agent_id
-             WHERE t.${t.col} = $1 ${whereAgent} LIMIT 1`,
-            args
+            role.isOwner
+                ? `SELECT * FROM ${t.table} WHERE ${t.col} = $1 LIMIT 1`
+                : `SELECT * FROM ${t.table} WHERE ${t.col} = $1 AND agent_id = $2 LIMIT 1`,
+            role.isOwner ? [t.val] : [t.val, role.agentId]
         );
         if (!r.rows.length) return res.json({ status: 'Not_Found', bank: t.bank, looked_for: t.val });
         const x = r.rows[0];
-        const out = {
+        const agents = await getAgents().catch(() => []);
+        const ag = x.agent_id ? agents.find(a => a.id === x.agent_id) : null;
+        return res.json({
             status: x.ref_no ? 'Found' : 'Found_FT_Pending',
-            bank: t.bank,
-            type: x.tx_type,
-            amount: parseFloat(x.amount),
-            ref: x.ref_no || x.v2_code || null,
-            ref_no: x.ref_no,
-            party: x.sender_name,
-            recipient_account: x.recipient_account || null,
-            usage: x.status,
-            category: x.category || null,
+            bank: t.bank, type: x.tx_type, amount: parseFloat(x.amount),
+            ref_no: x.ref_no, party: x.sender_name, usage: x.status, category: x.category || null,
             balance: x.balance != null ? parseFloat(x.balance) : null,
-            v2_code: x.v2_code || null,
-            created_at: x.created_at || null,
-            agent_id: x.agent_id || null,
-            agent: x.agent_name || (x.agent_id ? 'Agent #' + x.agent_id : 'Owner'),
-            claimed_by: x.claimed_by || null,
-            claimed_txn_id: x.claimed_txn_id || null,
-            claimed_at: x.claimed_at || null
-        };
-        if (req.query.live && t.bank === 'CBE' && (x.v2_code || inp.type === 'v2')) {
-            try {
-                const tg = cbeTargets(x.v2_code || inp.value)[0];
-                const j = JSON.parse((await fetchHttps(tg.host, tg.path, tg.headers)).body);
-                out.cbe_live = {
-                    ft: j.id, amount: j.debitAmount, from: j.debitAccountNo, to: j.creditAccountNo, date: j.debitValueDate,
-                    amount_matches_db: Math.abs(parseFloat(j.debitAmount) - out.amount) < 0.001
-                };
-            } catch (e) { out.cbe_live = { error: e.message }; }
-        }
-        return res.json(out);
+            v2_code: x.v2_code || null, created_at: x.created_at || null,
+            agent_id: x.agent_id || null, agent: ag ? ag.name : 'Owner',
+            claimed_by: x.claimed_by || null, claimed_txn_id: x.claimed_txn_id || null
+        });
     } catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
 });
 
 app.get('/api/recent', async (req, res) => {
-    const actor = await authOwnerOrAgent(req, res, true);
-    if (!actor) return;
-    const n = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
-    const filterAgent = actor.agent ? 'WHERE t.agent_id = $2' : '';
-    const args = actor.agent ? [n, actor.agent.id] : [n];
+    const role = await resolveRoleByToken(readToken(req)).catch(() => null);
+    if (!role) return res.status(401).json({ status: 'Unauthorized' });
 
-    try {
-        const baseCols = 't.id, t.tx_type, t.amount, t.ref_no, t.sender_name, t.recipient_account, t.status, t.category, t.balance, t.claimed_by, t.claimed_txn_id, t.claimed_at, t.agent_id, t.created_at, a.name AS agent_name';
-        const [c, tb] = await Promise.all([
-            pool.query(`SELECT ${baseCols}, t.v2_code, t.resolve_attempts FROM cbe_transactions t LEFT JOIN agents a ON a.id = t.agent_id ${filterAgent} ORDER BY t.id DESC LIMIT $1`, args),
-            pool.query(`SELECT ${baseCols} FROM telebirr_transactions t LEFT JOIN agents a ON a.id = t.agent_id ${filterAgent} ORDER BY t.id DESC LIMIT $1`, args)
-        ]);
-
-        const mapRow = (bank) => (row) => ({
-            id: row.id,
-            bank,
-            tx_type: row.tx_type,
-            type: row.tx_type,
-            amount: parseFloat(row.amount),
-            ref_no: row.ref_no,
-            ref: row.ref_no || row.v2_code || null,
-            sender_name: row.sender_name,
-            party: row.sender_name,
-            recipient_account: row.recipient_account || null,
-            status: row.status,
-            usage: row.status,
-            category: row.category || null,
-            balance: row.balance != null ? parseFloat(row.balance) : null,
-            v2_code: row.v2_code || null,
-            claimed_by: row.claimed_by || null,
-            claimed_txn_id: row.claimed_txn_id || null,
-            claimed_at: row.claimed_at || null,
-            agent_id: row.agent_id || null,
-            agent: row.agent_name || (row.agent_id ? 'Agent #' + row.agent_id : 'Owner'),
-            created_at: row.created_at
-        });
-
-        const cbeRows = c.rows.map(mapRow('CBE'));
-        const tbRows = tb.rows.map(mapRow('Telebirr'));
-        const items = [...cbeRows, ...tbRows]
-            .sort((a, b) => new Date(b.created_at) - new Date(a.created_at) || b.id - a.id)
-            .slice(0, n);
-
-        return res.json({
-            status: 'OK',
-            role: actor.role,
-            agent: actor.agent ? actor.agent.name : 'Owner',
-            agent_id: actor.agent ? actor.agent.id : null,
-            items,
-            cbe: cbeRows,
-            telebirr: tbRows
-        });
-    } catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
-});
-
-// ================= 6. AGENT MANAGEMENT (SECRET_TOKEN or VERIFY_TOKEN) =================
-app.get('/api/admin/agents', async (req, res) => {
-    if (!authVerify(req, res)) return;
-    try {
-        const rows = await getAgents(true);
-        return res.json({ status: 'OK', agents: rows });
-    } catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
-});
-
-async function handleCreateAgent(req, res) {
-    if (!authVerify(req, res)) return;
-    const name = String(param(req, 'name') || '').trim().slice(0, 80);
-    if (!name) return res.status(400).json({ status: 'Missing_Name' });
-    const token = String(param(req, 'new_token') || param(req, 'agent_token') || ('ag_' + crypto.randomBytes(16).toString('hex'))).trim();
-    const matchText = String(param(req, 'match_text') || param(req, 'matchText') || '').trim() || null;
-    const phone = String(param(req, 'phone') || '').trim() || null;
-    const cbeAccount = String(param(req, 'cbe_account') || param(req, 'cbeAccount') || '').trim() || null;
-    const notes = String(param(req, 'notes') || '').trim() || null;
-
-    try {
-        const r = await pool.query(
-            `INSERT INTO agents (name, token, match_text, phone, cbe_account, notes, active)
-             VALUES ($1,$2,$3,$4,$5,$6,TRUE)
-             RETURNING id, name, token, match_text, phone, cbe_account, notes, active, created_at`,
-            [name, token, matchText, phone, cbeAccount, notes]
-        );
-        invalidateAgentCache();
-        return res.json({ status: 'OK', agent: r.rows[0] });
-    } catch (e) {
-        if (e.code === '23505') return res.status(409).json({ status: 'Duplicate_Token_Or_Name' });
-        console.error(e);
-        return res.status(500).json({ status: 'Database_Error' });
+    const n = Math.min(Math.max(parseInt(req.query.limit) || 20, 1), 100);
+    const cacheKey = `${role.isOwner ? 'owner' : role.agentId}:${n}`;
+    const cached = recentCache.get(cacheKey);
+    if (cached && Date.now() - cached.at < RECENT_TTL) {
+        return res.json(cached.payload);
     }
-}
-app.post('/api/admin/agents', handleCreateAgent);
-app.get('/api/admin/agents/create', handleCreateAgent);
-app.post('/api/admin/agents/create', handleCreateAgent);
 
-async function handleToggleAgent(req, res) {
-    if (!authVerify(req, res)) return;
-    const id = parseInt(param(req, 'id'), 10);
-    if (isNaN(id)) return res.status(400).json({ status: 'Missing_Agent_Id' });
-    const explicit = param(req, 'active');
     try {
-        const r = explicit !== undefined
-            ? await pool.query('UPDATE agents SET active = $2 WHERE id = $1 RETURNING id, name, active', [id, String(explicit) === 'true' || explicit === true])
-            : await pool.query('UPDATE agents SET active = NOT active WHERE id = $1 RETURNING id, name, active', [id]);
-        if (!r.rows.length) return res.status(404).json({ status: 'Not_Found' });
-        invalidateAgentCache();
-        return res.json({ status: 'OK', agent: r.rows[0] });
+        const agents = await getAgents().catch(() => []);
+        const nameOf = (aid) => {
+            if (!aid) return 'Owner';
+            const found = agents.find(a => a.id === aid);
+            return found ? found.name : `Agent ${aid}`;
+        };
+        const cols = 'id, tx_type, amount, ref_no, sender_name, status, category, balance, agent_id, claimed_by, claimed_txn_id, recipient_account, created_at';
+        const whereSql = role.isOwner ? '' : 'WHERE agent_id = $2';
+        const params = role.isOwner ? [n] : [n, role.agentId];
+        const [c, t] = await Promise.all([
+            pool.query(`SELECT ${cols}, v2_code, resolve_attempts FROM cbe_transactions ${whereSql} ORDER BY id DESC LIMIT $1`, params),
+            pool.query(`SELECT ${cols} FROM telebirr_transactions ${whereSql} ORDER BY id DESC LIMIT $1`, params)
+        ]);
+        const cRows = c.rows.map(r => ({ ...r, bank: 'CBE', usage: r.status, agent: nameOf(r.agent_id) }));
+        const tRows = t.rows.map(r => ({ ...r, bank: 'Telebirr', usage: r.status, agent: nameOf(r.agent_id) }));
+        const payload = { status: 'OK', role: role.agentName, agent: role.agentName, cbe: cRows, telebirr: tRows };
+        recentCache.set(cacheKey, { at: Date.now(), payload });
+        return res.json(payload);
     } catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
-}
-app.get('/api/admin/agents/toggle', handleToggleAgent);
-app.post('/api/admin/agents/toggle', handleToggleAgent);
+});
 
-async function handleRotateAgentToken(req, res) {
-    if (!authVerify(req, res)) return;
-    const id = parseInt(param(req, 'id'), 10);
-    if (isNaN(id)) return res.status(400).json({ status: 'Missing_Agent_Id' });
-    const newToken = String(param(req, 'new_token') || param(req, 'agent_token') || ('ag_' + crypto.randomBytes(16).toString('hex'))).trim();
+// ================= 5. ADMIN AGENTS, AUDIT REPORTS & CBE HELPERS =================
+app.get('/api/admin/agents', async (req, res) => {
+    if (!authAdmin(req, res)) return;
     try {
-        const r = await pool.query('UPDATE agents SET token = $2 WHERE id = $1 RETURNING id, name, token, active', [id, newToken]);
-        if (!r.rows.length) return res.status(404).json({ status: 'Not_Found' });
-        invalidateAgentCache();
-        return res.json({ status: 'OK', agent: r.rows[0] });
+        const r = await pool.query('SELECT id, name, token, match_text, active, created_at FROM agents ORDER BY id');
+        return res.json({ status: 'OK', agents: r.rows });
     } catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
-}
-app.get('/api/admin/agents/rotate-token', handleRotateAgentToken);
-app.post('/api/admin/agents/rotate-token', handleRotateAgentToken);
+});
 
-async function handleUpdateAgent(req, res) {
-    if (!authVerify(req, res)) return;
-    const id = parseInt(param(req, 'id'), 10);
-    if (isNaN(id)) return res.status(400).json({ status: 'Missing_Agent_Id' });
+app.post('/api/admin/agents', async (req, res) => {
+    if (!authAdmin(req, res)) return;
+    const name = String(req.body?.name || req.query.name || '').trim();
+    const matchText = String(req.body?.match_text || req.query.match_text || '').trim() || null;
+    if (!name) return res.status(400).json({ status: 'Missing_Name' });
+    const token = 'ag_' + crypto.randomBytes(18).toString('hex');
     try {
         const r = await pool.query(
-            `UPDATE agents
-             SET name = COALESCE(NULLIF($2, ''), name),
-                 match_text = COALESCE($3, match_text),
-                 phone = COALESCE($4, phone),
-                 cbe_account = COALESCE($5, cbe_account),
-                 notes = COALESCE($6, notes)
-             WHERE id = $1
-             RETURNING id, name, token, match_text, phone, cbe_account, notes, active`,
-            [
-                id,
-                param(req, 'name') || '',
-                param(req, 'match_text') ?? param(req, 'matchText') ?? null,
-                param(req, 'phone') ?? null,
-                param(req, 'cbe_account') ?? param(req, 'cbeAccount') ?? null,
-                param(req, 'notes') ?? null
-            ]
+            'INSERT INTO agents (name, token, match_text, active) VALUES ($1, $2, $3, TRUE) RETURNING id, name, token, match_text, active',
+            [name, token, matchText]
         );
-        if (!r.rows.length) return res.status(404).json({ status: 'Not_Found' });
         invalidateAgentCache();
         return res.json({ status: 'OK', agent: r.rows[0] });
     } catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
-}
-app.get('/api/admin/agents/update', handleUpdateAgent);
-app.post('/api/admin/agents/update', handleUpdateAgent);
+});
 
-// ================= 7. AGENT REPORTS (Owner SECRET_TOKEN or VERIFY_TOKEN) =================
+app.post('/api/admin/agents/toggle', async (req, res) => {
+    if (!authAdmin(req, res)) return;
+    const id = parseInt(req.body?.id || req.query.id, 10);
+    if (isNaN(id)) return res.status(400).json({ status: 'Missing_Id' });
+    try {
+        const r = await pool.query('UPDATE agents SET active = NOT active WHERE id=$1 RETURNING id, name, active', [id]);
+        invalidateAgentCache();
+        return res.json({ status: 'OK', agent: r.rows[0] || null });
+    } catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
+});
+
+app.get('/api/admin/audit-prune', async (req, res) => {
+    if (!authAdmin(req, res)) return;
+    const days = Math.max(parseInt(req.query.days || String(RETENTION_DAYS), 10) || RETENTION_DAYS, 1);
+    await runAuditAndPrune(days);
+    return res.json({ status: 'OK', retention_days: days });
+});
+
+app.get('/api/admin/daily-audit', async (req, res) => {
+    if (!authAdmin(req, res)) return;
+    try {
+        const r = await pool.query('SELECT * FROM agent_daily_audit ORDER BY audit_date DESC, agent_id LIMIT 200');
+        return res.json({ status: 'OK', items: r.rows });
+    } catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
+});
+
 app.get('/api/agents', async (req, res) => {
-    if (!authVerify(req, res)) return;
+    if (!authAdmin(req, res)) return;
     try {
         const r = await pool.query(
-            `SELECT a.id, a.name, a.phone, a.cbe_account, a.active,
-                    COALESCE(SUM(t.amount) FILTER (WHERE t.tx_type = 'Received'), 0) AS total_in,
-                    COUNT(t.tx_id) FILTER (WHERE t.tx_type = 'Received') AS count_in,
-                    COALESCE(SUM(t.amount) FILTER (WHERE t.tx_type = 'Received' AND (t.created_at AT TIME ZONE 'Africa/Addis_Ababa')::date = (NOW() AT TIME ZONE 'Africa/Addis_Ababa')::date), 0) AS today_in,
-                    COALESCE(SUM(t.amount) FILTER (WHERE t.tx_type = 'Transferred'), 0) AS total_out,
-                    COUNT(t.tx_id) FILTER (WHERE t.tx_type = 'Transferred') AS count_out,
-                    COALESCE(SUM(t.amount) FILTER (WHERE t.tx_type = 'Transferred' AND t.status = 'Payout_Verified'), 0) AS verified_out,
-                    COALESCE(SUM(t.amount) FILTER (WHERE t.tx_type = 'Transferred' AND (t.created_at AT TIME ZONE 'Africa/Addis_Ababa')::date = (NOW() AT TIME ZONE 'Africa/Addis_Ababa')::date), 0) AS today_out
-             FROM agents a LEFT JOIN agent_transactions t ON t.agent_id = a.id
-             GROUP BY a.id ORDER BY a.id`
-        );
+            `SELECT a.id, a.name, a.active,
+                    COALESCE(SUM(d.amount),0) AS total_in,
+                    COUNT(d.tx_id) AS count_in,
+                    COALESCE(SUM(d.amount) FILTER (WHERE (d.created_at AT TIME ZONE 'Africa/Addis_Ababa')::date = (NOW() AT TIME ZONE 'Africa/Addis_Ababa')::date),0) AS today_in
+             FROM agents a LEFT JOIN agent_deposits d ON d.agent_id = a.id
+             GROUP BY a.id ORDER BY a.id`);
         return res.json({ status: 'OK', agents: r.rows });
     } catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
 });
 
 app.get('/api/agent/deposits', async (req, res) => {
-    if (!authVerify(req, res)) return;
-    const id = parseInt(req.query.agent, 10);
+    if (!authAdmin(req, res)) return;
+    const id = parseInt(req.query.agent);
     if (isNaN(id)) return res.json({ status: 'Missing_Agent' });
-    const n = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 500);
+    const n = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 500);
     const from = req.query.from || '1970-01-01';
     const to = req.query.to || '2999-12-31';
     try {
         const r = await pool.query(
-            `SELECT bank, tx_id, amount, ref_no, sender_name, balance, status, claimed_by, claimed_txn_id, created_at
+            `SELECT bank, tx_id, amount, ref_no, sender_name, balance, status, created_at
              FROM agent_deposits
              WHERE agent_id = $1
                AND (created_at AT TIME ZONE 'Africa/Addis_Ababa')::date BETWEEN $2::date AND $3::date
-             ORDER BY created_at DESC LIMIT $4`,
-            [id, from, to, n]
-        );
+             ORDER BY created_at DESC LIMIT $4`, [id, from, to, n]);
         const total = r.rows.reduce((s, x) => s + parseFloat(x.amount), 0);
         return res.json({ status: 'OK', agent: id, count: r.rows.length, total, items: r.rows });
     } catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
 });
 
-app.get('/api/agent/transactions', async (req, res) => {
-    if (!authVerify(req, res)) return;
-    const id = parseInt(req.query.agent, 10);
-    if (isNaN(id)) return res.json({ status: 'Missing_Agent' });
-    const n = Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 500);
-    const from = req.query.from || '1970-01-01';
-    const to = req.query.to || '2999-12-31';
+app.get('/api/cbe/resolve', async (req, res) => {
+    if (!authAdmin(req, res)) return;
+    const m = String(req.query.v2 || '').match(/v2-[A-Za-z0-9_-]+/i);
+    const ft = String(req.query.ft || '').trim().toUpperCase();
+    if (!m) return res.json({ status: 'Missing_V2' });
+    if (!/^FT[A-Z0-9]{8,15}$/.test(ft)) return res.json({ status: 'Invalid_FT' });
     try {
-        const r = await pool.query(
-            `SELECT bank, tx_id, tx_type, amount, ref_no, sender_name, recipient_account, balance, status, claimed_by, claimed_txn_id, created_at
-             FROM agent_transactions
-             WHERE agent_id = $1
-               AND (created_at AT TIME ZONE 'Africa/Addis_Ababa')::date BETWEEN $2::date AND $3::date
-             ORDER BY created_at DESC LIMIT $4`,
-            [id, from, to, n]
-        );
-        return res.json({ status: 'OK', agent: id, count: r.rows.length, items: r.rows });
+        const r = await pool.query('SELECT id FROM cbe_transactions WHERE v2_code=$1 AND ref_no IS NULL', [normV2(m[0])]);
+        if (!r.rows.length) return res.json({ status: 'Not_Pending' });
+        return res.json({ status: await settleFt(r.rows[0].id, ft), ref_no: ft });
     } catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
 });
 
-// health check: never touches the database
-app.get('/', (req, res) => res.json({ status: 'ok', service: 'HuluBet Verify Gateway' }));
+app.get('/api/cbe/pending', async (req, res) => {
+    if (!authAdmin(req, res)) return;
+    try {
+        const r = await pool.query(
+            `SELECT id, v2_code, amount, sender_name, resolve_attempts AS attempts
+             FROM cbe_transactions WHERE ref_no IS NULL AND COALESCE(category,'Transfer') NOT IN ('ATM/Card','Airtime','Data','Bill')
+             ORDER BY id DESC LIMIT 50`);
+        return res.json({ status: 'OK', count: r.rows.length, items: r.rows });
+    } catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
+});
+
+app.get('/api/cbe/debug', async (req, res) => {
+    if (!authAdmin(req, res)) return;
+    const m = String(req.query.v2 || '').match(/v2-[A-Za-z0-9_-]+/i);
+    if (!m) return res.json({ status: 'Missing_V2' });
+    const out = [];
+    for (const t of cbeTargets(m[0])) {
+        try {
+            const r = await fetchHttps(t.host, t.path, t.headers);
+            const ft = r.body.match(/\b(FT[A-Z0-9]{8,15})\b/i);
+            out.push({ target: t.name, http: r.status, bytes: r.body.length, ft: ft ? ft[1].toUpperCase() : null, body: r.body.replace(/\s+/g, ' ').slice(0, 400) });
+        } catch (e) { out.push({ target: t.name, error: e.message }); }
+    }
+    return res.json({ status: 'OK', results: out });
+});
+
+// Health check: NEVER touches DB
+app.get('/', (req, res) => res.json({ status: 'ok' }));
 
 if (require.main === module) {
     const PORT = process.env.PORT || 3000;
-    app.listen(PORT, () => {
-        console.log(`Unified Gateway running on port ${PORT}`);
-        scheduleResolve(5000);
-    });
+    ensureSchema()
+        .then(() => {
+            app.listen(PORT, () => {
+                console.log(`Unified Gateway running on port ${PORT}`);
+                scheduleResolve(5000);
+            });
+        })
+        .catch((err) => {
+            console.error('Startup schema error:', err);
+            process.exit(1);
+        });
 }
+
 module.exports = {
-    classify, extractAmount, extractBalance, extractTelebirrRef, extractParty,
-    extractRecipientAccount, accountsMatch, normalizePhoneCore,
-    detectCategory, extractV2Code, extractDirectFt, parseVerifyInput
+    classify, extractAmount, extractBalance, extractTelebirrRef,
+    extractParty, detectCategory, extractV2Code, extractDirectFt,
+    parseVerifyInput, scoreNameMatch, levenshtein
 };
