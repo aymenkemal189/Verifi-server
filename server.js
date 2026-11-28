@@ -25,13 +25,18 @@ app.use(cors());
 
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false },
+    ssl: process.env.DB_SSL === 'off' ? false : { rejectUnauthorized: false },
     max: 3,
     idleTimeoutMillis: 10000,
-    connectionTimeoutMillis: 10000
+    connectionTimeoutMillis: 10000,
+    query_timeout: 10000
 });
 pool.on('error', (e) => console.error('pool error:', e.message));
 process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e && e.message));
+const inflight = new Map();   // identical concurrent verify requests share one DB run
+// when the DB queue is long, answer fast so HuluBet retries later; the SMS webhook is never shed
+app.use(['/api/verify', '/api/verify-withdrawal', '/api/withdrawal-request', '/api/check-withdrawal'],
+    (req, res, next) => (pool.waitingCount > 8 ? res.status(503).json({ status: 'System_Busy' }) : next()));
 
 const BANKS = [['CBE', 'cbe_transactions'], ['Telebirr', 'telebirr_transactions']];
 const NON_HB = ['ATM/Card', 'Airtime', 'Data', 'Bill'];   // saved for agent audit only, never verified
@@ -246,6 +251,15 @@ async function ensureSchema() {
     await pool.query(`CREATE TABLE IF NOT EXISTS agents (
         id SERIAL PRIMARY KEY, name TEXT NOT NULL, token TEXT UNIQUE NOT NULL, match_text TEXT,
         active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS cbe_transactions (
+        id SERIAL PRIMARY KEY, tx_type TEXT NOT NULL, sender_name TEXT, amount NUMERIC(14,2) NOT NULL,
+        ref_no TEXT UNIQUE, raw_sms TEXT, status TEXT NOT NULL DEFAULT 'Unused', category TEXT, balance NUMERIC,
+        v2_code TEXT UNIQUE, resolve_attempts INTEGER NOT NULL DEFAULT 0, agent_id INTEGER,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS telebirr_transactions (
+        id SERIAL PRIMARY KEY, tx_type TEXT NOT NULL, sender_name TEXT, amount NUMERIC(14,2) NOT NULL,
+        ref_no TEXT NOT NULL UNIQUE, raw_sms TEXT, status TEXT NOT NULL DEFAULT 'Unused', category TEXT, balance NUMERIC,
+        agent_id INTEGER, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
     const common = ['agent_id INTEGER', 'recipient_account TEXT', 'claimed_by TEXT', 'claimed_txn_id TEXT',
         'claimed_at TIMESTAMPTZ', 'category TEXT', 'balance NUMERIC', 'created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()'];
     for (const [, t] of BANKS) for (const c of common) await pool.query(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS ${c}`);
@@ -271,6 +285,16 @@ async function ensureSchema() {
         `CREATE UNIQUE INDEX IF NOT EXISTS uq_tb_wid ON telebirr_transactions (claimed_txn_id) WHERE status = 'Payout_Verified'`
     ];
     for (const sql of idx) await pool.query(sql).catch(e => console.error('index skipped:', e.message));
+    const v = await pool.query("SELECT to_regclass('agent_deposits') AS r");
+    if (!v.rows[0].r) {
+        await pool.query(`CREATE VIEW agent_deposits AS
+            SELECT 'CBE'::text AS bank, id AS tx_id, amount, ref_no, sender_name, balance, status, created_at, agent_id
+              FROM cbe_transactions WHERE tx_type='Received' AND agent_id IS NOT NULL
+            UNION ALL
+            SELECT 'Telebirr'::text, id, amount, ref_no, sender_name, balance, status, created_at, agent_id
+              FROM telebirr_transactions WHERE tx_type='Received' AND agent_id IS NOT NULL`)
+            .catch(e => console.error('view skipped:', e.message));
+    }
     console.log('schema ready');
 }
 
@@ -523,16 +547,25 @@ app.get('/api/verify', async (req, res) => {
     const by = str(req.query.username || req.query.claimed_by).slice(0, 100) || null;
     const txn = str(req.query.txn_id || req.query.claimed_txn_id).slice(0, 100) || null;
     const wait = req.query.wait !== undefined ? clamp(parseInt(req.query.wait) || 0, 0, 20) : VERIFY_WAIT;
+    const key = [inp.type, inp.value, expected, by || '', txn || ''].join(':');
     try {
-        let r = await tryDeposit(inp, expected, by, txn);
-        if (r.why && (r.why.status === 'Pending' || r.why.status === 'Resolving') && wait > 0) {
-            if (await waitFor(r.keys, wait * 1000)) r = await tryDeposit(inp, expected, by, txn);
+        let p = inflight.get(key);
+        if (!p) {
+            p = (async () => {
+                let r = await tryDeposit(inp, expected, by, txn);
+                if (r.why && (r.why.status === 'Pending' || r.why.status === 'Resolving') && wait > 0) {
+                    if (await waitFor(r.keys, wait * 1000)) r = await tryDeposit(inp, expected, by, txn);
+                }
+                if (!r.tx) return r.why;
+                dropRecent();
+                const nm = await nameMap();
+                return { status: 'Verified', bank: r.bank, amount: parseFloat(r.tx.amount), ref_no: r.tx.ref_no,
+                    from_to: r.tx.sender_name, agent: nm(r.tx.agent_id), agent_id: r.tx.agent_id || null, claimed_by: by };
+            })();
+            inflight.set(key, p);
+            p.finally(() => inflight.delete(key)).catch(() => {});
         }
-        if (!r.tx) return res.json(r.why);
-        dropRecent();
-        const nm = await nameMap();
-        return res.json({ status: 'Verified', bank: r.bank, amount: parseFloat(r.tx.amount), ref_no: r.tx.ref_no,
-            from_to: r.tx.sender_name, agent: nm(r.tx.agent_id), agent_id: r.tx.agent_id || null, claimed_by: by });
+        return res.json(await p);
     } catch (e) { console.error(e); return res.status(500).json({ status: 'System_Busy' }); }
 });
 
@@ -547,6 +580,14 @@ async function lockPayout(table, id, wid, by) {
         return r.rows[0] || null;
     } catch (e) { if (e.code === '23505') return 'dup'; throw e; }
 }
+function allSameRecipient(rows) {
+    if (!rows || rows.length <= 1) return false;
+    const accts = rows.map(r => last4(r.recipient_account)).filter(Boolean);
+    const names = rows.map(r => String(r.sender_name || '').toLowerCase().replace(/\s+/g, ' ').trim()).filter(Boolean);
+    const sameAcct = accts.length === rows.length && new Set(accts).size === 1;
+    const sameName = names.length === rows.length && new Set(names).size === 1;
+    return sameAcct || sameName;
+}
 async function handleWithdrawal(req, res, lock) {
     if (!authVerify(req, res)) return;
     const q = { ...req.query, ...bodyOf(req) };
@@ -557,6 +598,8 @@ async function handleWithdrawal(req, res, lock) {
     const expected = parseFloat(q.amount), bankF = str(q.bank).toLowerCase();
     const hours = clamp(parseInt(q.hours) || 72, 1, 720);
     const agentF = q.agent_id ? parseInt(q.agent_id, 10) : null;
+    let sinceMs = Number(q.since);
+    if (!Number.isFinite(sinceMs) || sinceMs <= 0) sinceMs = 0; else if (sinceMs < 1e12) sinceMs *= 1000;
     if (!(expected > 0)) return res.json({ status: 'Missing_Amount' });
     if (!ref && !name && !account) return res.json({ status: 'Missing_Params', message: 'Provide ref OR name/account + amount' });
     try {
@@ -589,7 +632,7 @@ async function handleWithdrawal(req, res, lock) {
             for (const [bank, table] of list) {
                 const hasAg = agentF !== null && !isNaN(agentF);
                 const r = await pool.query(
-                    `SELECT id, amount, ref_no, sender_name, agent_id, recipient_account FROM ${table}
+                    `SELECT id, amount, ref_no, sender_name, agent_id, recipient_account, created_at FROM ${table}
                      WHERE status='Sent_Locked' AND tx_type='Transferred' AND ABS(amount-$1) < 0.01
                        AND created_at >= NOW() - ($2 || ' hours')::interval ${hasAg ? 'AND agent_id=$3' : ''}
                      ORDER BY id DESC LIMIT 25`, hasAg ? [expected, String(hours), agentF] : [expected, String(hours)]);
@@ -602,10 +645,18 @@ async function handleWithdrawal(req, res, lock) {
                 }
             }
             if (!cands.length) return res.json({ status: 'Not_Found', amount: expected, looked_for_name: name || null });
-            cands.sort((a, b) => b.score - a.score || a.row.id - b.row.id);
-            if (cands.length > 1 && cands[0].score - cands[1].score < 0.05)
-                return res.json({ status: 'Ambiguous', count: cands.length, refs: cands.slice(0, 5).map(x => x.row.ref_no) });
-            target = cands[0];
+            const ts = (x) => (x.row.created_at ? new Date(x.row.created_at).getTime() : 0);
+            cands.sort((a, b) => b.score - a.score || ts(b) - ts(a) || b.row.id - a.row.id);   // best score, then newest
+            let top = cands.filter(x => cands[0].score - x.score < 0.05);
+            if (sinceMs) {
+                const recent = top.filter(x => !x.row.created_at || ts(x) >= sinceMs - 120000);
+                if (recent.length) top = recent;
+            }
+            if (top.length > 1) {
+                if ((name || account) && allSameRecipient(top.map(x => x.row))) top = [top[0]];   // same person: take the newest
+                else return res.json({ status: 'Ambiguous', count: top.length, refs: top.slice(0, 5).map(x => x.row.ref_no) });
+            }
+            target = top[0];
         }
 
         if (!lock) return res.json(body('Match_Found', target.bank, target.row, { match_score: Number(target.score.toFixed(2)) }));
@@ -777,6 +828,18 @@ app.get('/api/cbe/pending', async (req, res) => {
         const r = await pool.query(`SELECT id, v2_code, amount, sender_name, resolve_attempts AS attempts FROM cbe_transactions
             WHERE ref_no IS NULL AND COALESCE(category,'Transfer') NOT IN ('ATM/Card','Airtime','Data','Bill') ORDER BY id DESC LIMIT 50`);
         return res.json({ status: 'OK', count: r.rows.length, items: r.rows });
+    } catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
+});
+
+// admin: connection pool + database size (open: /api/health?token=SECRET)
+app.get('/api/health', async (req, res) => {
+    if (!authAdmin(req, res)) return;
+    try {
+        const sz = await pool.query('SELECT pg_database_size(current_database()) AS bytes');
+        const t = await pool.query(`SELECT relname, reltuples::bigint AS approx_rows FROM pg_class
+            WHERE relname IN ('cbe_transactions','telebirr_transactions','agent_daily_audit')`);
+        return res.json({ status: 'OK', pool: { total: pool.totalCount, idle: pool.idleCount, waiting: pool.waitingCount },
+            waiting_verifies: waiting, inflight: inflight.size, db_mb: Math.round(sz.rows[0].bytes / 1048576), tables: t.rows });
     } catch (e) { console.error(e); return res.status(500).json({ status: 'Database_Error' }); }
 });
 
